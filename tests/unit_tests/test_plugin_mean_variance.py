@@ -36,6 +36,11 @@ class TestMeanVariancePlugin:
           "solver": {
             "keep_files": False,
             "use_scaling": False
+          },
+          "plugins": {
+              "mean_variance_optimization": {
+                  "weighting_factor": 0.01
+              }
           }
         }
         optimization_setup = create_optimization_setup(config)
