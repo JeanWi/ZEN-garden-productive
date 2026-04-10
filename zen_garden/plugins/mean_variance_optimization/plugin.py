@@ -6,7 +6,8 @@ from zen_garden.model.element import GenericRule
 
 # Todo: add types for type checking
 config = {
-    "weighting_factor": None
+    "weighting_factor": None,
+    "variances_file_path": None
 }
 
 def remove_objective_from_model(model):
@@ -23,7 +24,12 @@ def read_variances(optimization_setup):
         - make path to variances file more flexible
         - implement indexing of variables
     """
-    dict = pd.read_excel("C:/Users/jwiegner/ZEN_universe/ZEN-garden-productive/VarianceFactors.xlsx", index_col=0).to_dict()
+    if config.get("variances_file_path") is None:
+        raise Exception("Variance file path is not set in the config.")
+    try:
+        dict = pd.read_excel(config.get("variances_file_path"), index_col=0).to_dict()
+    except FileNotFoundError:
+        raise Exception(f"Variances file not found at path {config.get('variances_file_path')}")
     return dict["Variance"]
 
 class MeanVarianceRules(GenericRule):
@@ -40,6 +46,9 @@ class MeanVarianceRules(GenericRule):
         """
         Defines an objective function optimizing the mean-variance formulation.
 
+        Todo:
+            - Implement covariances between variables
+
         """
         quad_terms = []
         model = self.optimization_setup.model
@@ -52,17 +61,18 @@ class MeanVarianceRules(GenericRule):
             # sum over all indices of the quadratic expression to get a scalar term
             quad_terms.append(quad.sum())
 
-        return lp.expressions.merge(quad_terms) + model.variables[
+        return weighting_factor * lp.expressions.merge(quad_terms) + model.variables[
             "net_present_cost"
         ].sum("set_time_steps_yearly")
 
 
 @EventPublisher.register(Event.after_model_construction)
 def construct_mean_variance_objective(optimization_setup=None):
-    remove_objective_from_model(optimization_setup.model)
     variances = read_variances(optimization_setup)
     weighting_factor = config.get("weighting_factor")
 
+    # Define new objective
+    remove_objective_from_model(optimization_setup.model)
     rules = MeanVarianceRules(optimization_setup)
     objective = rules.define_mean_variance_objective(variances, weighting_factor)
     sense = "min"

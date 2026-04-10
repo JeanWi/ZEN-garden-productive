@@ -39,7 +39,8 @@ class TestMeanVariancePlugin:
           },
           "plugins": {
               "mean_variance_optimization": {
-                  "weighting_factor": 0.01
+                  "weighting_factor": 0.01,
+                  "variances_file_path": "C:/Users/jwiegner/ZEN_universe/ZEN-garden-productive/VarianceFactors.xlsx"
               }
           }
         }
