@@ -30,7 +30,7 @@ Default values are overwritten by any changes specified in the input files
 ``system.json``, ``scenarios.json``, and ``config.json``.
 """
 
-from typing import Any, Literal, Optional, Union
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -214,7 +214,7 @@ class Analysis(Subscriptable):
     """
 
     dataset: str = ""
-    objective: Literal["total_cost", "total_carbon_emissions"] = "total_cost"
+    objective: str = "total_cost"
     sense: str = "min"
     subsets: Subsets = Subsets()
     header_data_inputs: HeaderDataInputs = HeaderDataInputs()
