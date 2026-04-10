@@ -4,8 +4,9 @@ import pandas as pd
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.model.element import GenericRule
 
+# Todo: add types for type checking
 config = {
-    "weighting_factor": 0.1
+    "weighting_factor": None
 }
 
 def remove_objective_from_model(model):
@@ -15,6 +16,13 @@ def remove_objective_from_model(model):
     model.remove_objective()
 
 def read_variances(optimization_setup):
+    """
+    Reads the variances and returns them as a dictionary with an entry for each variable.
+
+    Todo:
+        - make path to variances file more flexible
+        - implement indexing of variables
+    """
     dict = pd.read_excel("C:/Users/jwiegner/ZEN_universe/ZEN-garden-productive/VarianceFactors.xlsx", index_col=0).to_dict()
     return dict["Variance"]
 
@@ -32,8 +40,6 @@ class MeanVarianceRules(GenericRule):
         """
         Defines an objective function optimizing the mean-variance formulation.
 
-        Defines a new objective function that minimizes the variance of the decision variables.
-        The variances are calculated based on the decision variables and a weighting factor is applied.
         """
         quad_terms = []
         model = self.optimization_setup.model
