@@ -21,7 +21,7 @@ Plugin contract
 - Registration: use the `Event` helper to attach functions to events
   (see `zen_garden.events.Event` for available events). The function will
   be called at the respective event.
-- Config: use the dictonary at `config.plugins` to specify a config to
+- Config: use the dictionary at `config.plugins` to specify a config to
   pass to the plugin.
 
 Minimal example

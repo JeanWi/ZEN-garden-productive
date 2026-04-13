@@ -135,6 +135,6 @@ Plugins
 
 Activating plugins and passing configurations to plugins is done by modifying the ``plugins`` key
 in the ``config.json``. The key name corresponds to the plugin name to be activated.
-the dictonary under this key defines the configuration for the plugin.
+the dictionary under this key defines the configuration for the plugin.
 
 
