@@ -16,6 +16,9 @@ from .optimization_setup import OptimizationSetup
 from .postprocess.postprocess import Postprocess
 from .utils import InputDataChecks, ScenarioUtils, StringUtils, setup_logger
 
+import numpy as np
+import xarray as xr
+
 # we setup the logger here
 setup_logger()
 
@@ -134,7 +137,7 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
             # overwrite time indices
             optimization_setup.overwrite_time_indices(step)
             # create optimization problem
-            optimization_setup.construct_optimization_problem()
+            optimization_setup.construct_optimization_problem() #in energy_system.py line 524 (also creates objective function)
             if optimization_setup.solver.use_scaling:
                 optimization_setup.scaling.run_scaling()
             elif (
@@ -143,7 +146,7 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
             ):
                 optimization_setup.scaling.analyze_numerics()
             # SOLVE THE OPTIMIZATION PROBLEM
-            optimization_setup.solve()
+            optimization_setup.solve() # in optimization_setup.py line 676 (minimizes cost function)
             # break if infeasible
             if not optimization_setup.optimality:
                 # write IIS
@@ -176,5 +179,99 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
                 scenario_name=scenario_name,
                 param_map=param_map,
             )
+
+    # === MGA FEASIBILITY TEST ===
+
+    # 1 Variable handle (linopy symbolic variable, not solution values)
+    model = optimization_setup.model
+    cap_add = model.variables["capacity_addition"]
+
+    # 2 Capture baseline: optimal cost C* and the full baseline solution.
+    #    The solution snapshot is needed BEFORE the second solve overwrites it.
+    c_star = model.objective.value
+    baseline_sol = model.solution["capacity_addition"]
+    baseline_nuclear = baseline_sol.sel(set_technologies="nuclear").sum().item()
+    baseline_pv      = baseline_sol.sel(set_technologies="photovoltaics").sum().item()
+    logging.info(f"C* = {c_star}")
+    logging.info(f"Baseline nuclear total: {baseline_nuclear}")
+    logging.info(f"Baseline PV total:      {baseline_pv}")
+
+    # 3 Near-optimality constraint: f(x) <= (1+eps) * C*.
+    #    objective_total_cost(model) returns the original cost LinearExpression
+    #    without setting it as the model's objective, so we can reuse it as a
+    #    constraint while replacing the objective with the MGA one.
+    epsilon = 0.1
+    orig_cost_expr = optimization_setup.energy_system.rules.objective_total_cost(model)
+    model.add_constraints(
+        orig_cost_expr <= (1 + epsilon) * c_star,
+        name="mga_near_optimality",
+    )
+    logging.info(f"Added constraint: cost <= {(1 + epsilon) * c_star}")
+
+    # 4 Generic w-builder: takes a {tech_name: weight} dict and returns an
+    #    xarray.DataArray indexed only by set_technologies. xarray broadcasts
+    #    this across (cap_type, location, year) automatically when multiplied
+    #    with capacity_addition. No hardcoded technology names inside.
+    def build_w_from_dict(model, weights: dict) -> xr.DataArray:
+        tech_coord = model.variables["capacity_addition"].coords["set_technologies"]
+        w = xr.DataArray(
+            np.zeros(tech_coord.size),
+            dims=("set_technologies",),
+            coords={"set_technologies": tech_coord},
+        )
+        known = set(tech_coord.values)
+        for tech, val in weights.items():
+            if tech not in known:
+                raise KeyError(f"Unknown technology in weights: {tech!r}")
+            w.loc[tech] = float(val)
+        return w
+
+    # 5 MGA objective: g = sum_i w_i * x_i, minimized.
+    #    Convention: w_i > 0 penalizes tech i, w_i < 0 promotes it.
+    #    overwrite=True is required to replace the original cost objective.
+    weights = {"nuclear": -1.0, "photovoltaics": +1.0}
+    w = build_w_from_dict(model, weights)
+    mga_obj = (w * cap_add).sum()
+    model.add_objective(mga_obj, sense="min", overwrite=True)
+    logging.info(f"MGA weights: {weights}")
+    logging.info("Objective replaced: minimize sum_i w_i * x_i")
+
+    # 6 Re-solve with modified problem (constraint + new objective).
+    optimization_setup.solve()
+    logging.info(f"MGA termination: {model.termination_condition}")
+
+    # 7 Validation (smoke-test specific; not part of the MGA feature itself):
+    #    check that promoted/penalized techs moved as expected and that the
+    #    cost stayed within the near-optimality bound.
+    sol = model.solution["capacity_addition"]
+    mga_nuclear = sol.sel(set_technologies="nuclear").sum().item()
+    mga_pv      = sol.sel(set_technologies="photovoltaics").sum().item()
+    mga_cost    = orig_cost_expr.solution.sum().item()
+
+    logging.info("\n=== RESULTS ===")
+    logging.info(f"Baseline nuclear: {baseline_nuclear}")
+    logging.info(f"MGA nuclear (w=-1, should INCREASE): {mga_nuclear}")
+    logging.info(f"Baseline PV: {baseline_pv}")
+    logging.info(f"MGA PV (w=+1, should DECREASE): {mga_pv}")
+    logging.info(f"MGA cost: {mga_cost}")
+    logging.info(f"Cost bound (1+eps)*C*: {(1 + epsilon) * c_star}")
+    logging.info(f"Cost feasible: {mga_cost <= (1 + epsilon) * c_star}")
+    logging.info("=== MGA FEASIBILITY TEST COMPLETE ===")
+
+    # 8 Persist MGA solution as a sibling subsolution.
+    #    Using a modified model_name puts the MGA output in a parallel folder
+    #    next to the baseline, which zen-visualization surfaces as a separate
+    #    selectable subsolution.
+    Postprocess(
+        optimization_setup,
+        scenarios=config.scenarios,
+        model_name=model_name + "_mga_iter_0",
+        subfolder=subfolder,
+        scenario_name=scenario_name,
+        param_map=param_map,
+    )
+    logging.info(f"MGA solution written to subsolution '{model_name}_mga_iter_0'")
+
+
     logging.info("--- Optimization finished ---")
     return optimization_setup
