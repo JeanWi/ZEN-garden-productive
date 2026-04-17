@@ -24,6 +24,7 @@ from zen_garden.preprocess.parameter_change_log import parameter_change_log
 from zen_garden.preprocess.time_series_aggregation import TimeSeriesAggregation
 from zen_garden.preprocess.unit_handling import Scaling
 from zen_garden.utils import IISConstraintParser, ScenarioDict, StringUtils
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class OptimizationSetup(object):
@@ -94,6 +95,7 @@ class OptimizationSetup(object):
             for element_name in element_classes
             if "Technology" in element_name
         ]
+
         self.element_list = technology_classes + carrier_classes
 
         # step of optimization horizon
@@ -104,6 +106,7 @@ class OptimizationSetup(object):
 
         # add Elements to optimization
         self.add_elements()
+        EventPublisher.trigger(Event.add_element, optimization_setup=self)
 
         # check if all elements from the scenario_dict are in the model
         ScenarioDict.check_if_all_elements_in_model(
