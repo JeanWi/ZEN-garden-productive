@@ -638,7 +638,8 @@ class Parameter(Component):
         """
         if isinstance(data, pd.Series):
             # if single entry in index
-            if len(data.index[0]) == 1:
+            first_index = data.index[0]
+            if isinstance(first_index, tuple) and len(first_index) == 1:
                 data.index = pd.Index(sum(data.index.values, ()))
             data = data.to_dict()
         return data
@@ -652,7 +653,8 @@ class Parameter(Component):
         """
         if isinstance(data, pd.Series):
             # if single entry in index
-            if len(data.index[0]) == 1:
+            first_index = data.index[0]
+            if isinstance(first_index, tuple) and len(first_index) == 1:
                 data.index = pd.Index(sum(data.index.values, ()))
             if len(data.index.names) == len(index_list):
                 data.index.names = index_list
@@ -1064,7 +1066,7 @@ class Constraint(Component):
             rhs = rhs.drop_sel(group=drop, errors="ignore")
             sign = sign.drop_sel(group=drop, errors="ignore")
 
-        # drop the unncessessary dimensions
+        # drop the unncessary dimensions
         lhs = lhs.drop_vars(list(set(lhs.coords) - set(lhs.dims)))
 
         # get the coordinates
