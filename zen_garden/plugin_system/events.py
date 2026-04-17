@@ -38,6 +38,7 @@ class Event(Enum):
     test_event2 = auto()
     before_model_construction = auto()
     after_model_construction = auto()
+    add_element = auto()
 
 
 class EventPublisher:
