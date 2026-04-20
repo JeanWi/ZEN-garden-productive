@@ -12,6 +12,7 @@ from linopy.expressions import LinearExpression
 
 from ..component import ZenIndex
 from ..element import Element, GenericRule
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class Carrier(Element):
@@ -37,8 +38,12 @@ class Carrier(Element):
         # store scenario dict
         super().store_scenario_dict()
         # set attributes of carrier
-        # raw import
         self.raw_time_series = dict()
+
+        # Allow code injection with plugins
+        EventPublisher.trigger(Event.on_carrier_store_input_data, carrier=self)
+
+        # raw import
         self.raw_time_series["demand"] = self.data_input.extract_input_data(
             "demand",
             index_sets=["set_nodes", "set_time_steps"],
@@ -131,6 +136,8 @@ class Carrier(Element):
 
         :param optimization_setup: The OptimizationSetup the element is part of
         """
+        EventPublisher.trigger(Event.on_carrier_construct_params, optimization_setup=optimization_setup, carrier_cls=cls)
+
         # demand of carrier
         optimization_setup.parameters.add_parameter(
             name="demand",

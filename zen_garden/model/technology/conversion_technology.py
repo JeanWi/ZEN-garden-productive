@@ -16,6 +16,7 @@ from zen_garden.utils import align_like
 
 from ..element import GenericRule
 from .technology import Technology
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class ConversionTechnology(Technology):
@@ -65,6 +66,9 @@ class ConversionTechnology(Technology):
         """
         # get attributes from class <Technology>
         super().store_input_data()
+
+        EventPublisher.trigger(Event.on_conversion_technology_store_input_data, self)
+
         # get conversion efficiency and capex
         self.get_conversion_factor()
         self.opex_specific_fixed = self.data_input.extract_input_data(
@@ -259,6 +263,9 @@ class ConversionTechnology(Technology):
 
         :param optimization_setup: The OptimizationSetup the element is part of
         """
+
+        EventPublisher.trigger(Event.on_conversion_technology_construct_params, optimization_setup=optimization_setup, technology_cls=cls)
+
         # slope of linearly modeled capex
         optimization_setup.parameters.add_parameter(
             name="capex_specific_conversion",
