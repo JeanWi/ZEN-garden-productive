@@ -3,7 +3,7 @@
     "default_value": 0.0,
     "unit": "GW"
   },
-"capacity_addition_max": {
+  "capacity_addition_max": {
     "default_value": "inf",
     "unit": "GW"
   },
@@ -67,10 +67,10 @@
     ]
   },
   "conversion_factor": {
-      "natural_gas": {
-        "default_value": 1.1,
-        "unit": "GWh/GWh"
-      }
+    "natural_gas": {
+      "default_value": 1.1,
+      "unit": "GWh/GWh"
+    }
   },
   "capex_specific_conversion": {
     "default_value": 876.0,
@@ -79,5 +79,9 @@
   "capacity_addition_unbounded": {
     "default_value": 0.0,
     "unit": "GW"
+  },
+  "variance_capex_specific_conversion": {
+    "default_value": 0.05,
+    "unit": "1"
   }
 }

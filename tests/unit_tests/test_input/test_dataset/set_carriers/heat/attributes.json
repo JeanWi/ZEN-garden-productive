@@ -38,5 +38,17 @@
   "price_import": {
     "default_value": 0.0,
     "unit": "kiloEuro/GWh"
+  },
+  "variance_price_export": {
+    "default_value": 0.05,
+    "unit": "1"
+  },
+  "variance_price_import": {
+    "default_value": 0.05,
+    "unit": "1"
+  },
+  "variance_price_shed_demand": {
+    "default_value": 0.05,
+    "unit": "1"
   }
 }

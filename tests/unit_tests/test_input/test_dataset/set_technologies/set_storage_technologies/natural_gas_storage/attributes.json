@@ -115,5 +115,9 @@
   "flow_storage_inflow": {
     "default_value": 0.0,
     "unit": "GW"
+  },
+  "variance_capex_specific_storage": {
+    "default_value": 0.05,
+    "unit": "1"
   }
 }

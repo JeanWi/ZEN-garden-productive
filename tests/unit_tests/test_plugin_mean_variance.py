@@ -25,6 +25,7 @@ def create_input_data_checks_from_config(config):
 def create_optimization_setup(config):
     config = create_config(config)
     register_plugins(config.plugins)
+    EventPublisher.trigger(Event.on_preprocessing, config)
     input_data_checks = create_input_data_checks_from_config(config)
     optimization_setup = OptimizationSetup(config=config, scenario_dict={}, input_data_checks=input_data_checks)
     return optimization_setup
@@ -45,7 +46,6 @@ class TestMeanVariancePlugin:
         }
         optimization_setup = create_optimization_setup(config)
 
-        EventPublisher.trigger(Event.before_model_construction, optimization_setup=optimization_setup)
         optimization_setup.construct_optimization_problem()
         EventPublisher.trigger(Event.after_model_construction, optimization_setup=optimization_setup)
 
