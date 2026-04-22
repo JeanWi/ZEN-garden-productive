@@ -6,72 +6,71 @@ from pathlib import Path
 
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.model.element import GenericRule, Element
+from zen_garden.model.component import IndexSet
 from zen_garden.preprocess.extract_input_data import DataInput
 from zen_garden.preprocess.unit_handling import UnitHandling
 
-# Todo: add types for type checking
+
 config = {
     "weighting_factor": None,
+    "include_variances_for": ["capex", "opex", "import", "export", "demand_shedding"],
 }
+
+def _update_dict(dict, dict_to_add, fields_to_update):
+
+    for key in fields_to_update:
+        if key not in dict and key in dict_to_add:
+            dict[key] = dict_to_add[key]
+    return dict
+
+def _update_attribute_in_json(dir, attributes_to_update: list, attribute_value):
+    attr_file = dir / "attributes.json"
+
+    with open(attr_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    updated_data = _update_dict(data, attribute_value, attributes_to_update)
+
+    with open(attr_file, "w", encoding="utf-8") as f:
+            json.dump(updated_data, f, indent=2)
 
 def _update_carrier_attributes(variance_attributes, config):
     carrier_path = Path(config.analysis.dataset) / "set_carriers"
 
     for carrier_dir in carrier_path.iterdir():
-        attr_file = carrier_dir / "attributes.json"
+        update_attributes = ["variance_price_export", "variance_price_import", "variance_price_shed_demand"]
+        _update_attribute_in_json(carrier_dir, update_attributes, variance_attributes)
 
-        with open(attr_file, "r", encoding="utf-8") as f:
-            carrier_data = json.load(f)
-
-        carrier_attributes_to_update = ["variance_price_export", "variance_price_import", "variance_price_shed_demand"]
-        updated_carrier_data = _update_attributes(carrier_data, variance_attributes, carrier_attributes_to_update)
-
-        with open(attr_file, "w", encoding="utf-8") as f:
-            json.dump(updated_carrier_data, f, indent=2)
 
 def _update_conversion_technology_attributes(variance_attributes, config):
 
     tech_path = Path(config.analysis.dataset) / "set_technologies" / "set_conversion_technologies"
     for tech_dir in tech_path.iterdir():
         if not "set_retrofitting_technologies" in tech_dir.parts:
-            attr_file = tech_dir / "attributes.json"
+            update_attributes = ["variance_capex_specific_conversion", "variance_opex_specific_variable"]
+            _update_attribute_in_json(tech_dir, update_attributes, variance_attributes)
 
-            with open(attr_file, "r", encoding="utf-8") as f:
-                tech_data = json.load(f)
+def _update_storage_technology_attributes(variance_attributes, config):
 
-            tech_attributes_to_update = []
-            tech_attributes_to_update.append("variance_capex_specific_conversion")
+    tech_path = Path(config.analysis.dataset) / "set_technologies" / "set_storage_technologies"
+    for tech_dir in tech_path.iterdir():
+        update_attributes = ["variance_capex_specific_storage", "variance_opex_specific_variable"]
+        _update_attribute_in_json(tech_dir, update_attributes, variance_attributes)
 
-            updated_tech_data = _update_attributes(tech_data, variance_attributes, tech_attributes_to_update)
+def _update_transport_technology_attributes(variance_attributes, config):
 
-            with open(attr_file, "w", encoding="utf-8") as f:
-                json.dump(updated_tech_data, f, indent=2)
+    tech_path = Path(config.analysis.dataset) / "set_technologies" / "set_transport_technologies"
+    for tech_dir in tech_path.iterdir():
+        update_attributes = ["variance_capex_specific_transport", "variance_opex_specific_variable"]
+        _update_attribute_in_json(tech_dir, update_attributes, variance_attributes)
 
 def _update_retrofitting_technology_attributes(variance_attributes, config):
 
     tech_path = Path(config.analysis.dataset) / "set_technologies" / "set_conversion_technologies" / "set_retrofitting_technologies"
-    for tech_dir in tech_path.iterdir():
-        attr_file = tech_dir / "attributes.json"
-
-        with open(attr_file, "r", encoding="utf-8") as f:
-            tech_data = json.load(f)
-
-        tech_attributes_to_update = []
-        tech_attributes_to_update.append("variance_capex_specific_conversion")
-
-        updated_tech_data = _update_attributes(tech_data, variance_attributes, tech_attributes_to_update)
-
-        with open(attr_file, "w", encoding="utf-8") as f:
-            json.dump(updated_tech_data, f, indent=2)
-
-
-
-def _update_attributes(carrier_data, variance_attributes, field_to_update):
-
-    for key in field_to_update:
-        if key not in carrier_data and key in variance_attributes:
-            carrier_data[key] = variance_attributes[key]
-    return carrier_data
+    if tech_path.exists():
+        for tech_dir in tech_path.iterdir():
+            update_attributes = ["variance_capex_specific_retrofitting", "variance_opex_specific_variable"]
+            _update_attribute_in_json(tech_dir, update_attributes, variance_attributes)
 
 @EventPublisher.register(Event.on_preprocessing)
 def add_variance_to_attribute_jsons(config):
@@ -83,6 +82,8 @@ def add_variance_to_attribute_jsons(config):
 
     _update_carrier_attributes(variance_attributes, config)
     _update_conversion_technology_attributes(variance_attributes, config)
+    _update_storage_technology_attributes(variance_attributes, config)
+    _update_transport_technology_attributes(variance_attributes, config)
     _update_retrofitting_technology_attributes(variance_attributes, config)
 
 @EventPublisher.register(Event.on_carrier_store_input_data)
@@ -108,10 +109,48 @@ def add_variance_to_carrier(carrier):
     )
 
 
+@EventPublisher.register(Event.on_technology_store_input_data)
+def add_variance_to_technology(technology):
+    set_location = technology.location_type
+
+    technology.variance_opex_specific_variable = technology.data_input.extract_input_data(
+        "variance_opex_specific_variable",
+        index_sets=[set_location, "set_time_steps"],
+        time_steps="set_base_time_steps_yearly",
+        unit_category={},
+    )
+
 @EventPublisher.register(Event.on_conversion_technology_store_input_data)
 def add_variance_to_conversion_technology(technology):
     technology.variance_capex_specific_conversion = technology.data_input.extract_input_data(
         "variance_capex_specific_conversion",
+        index_sets=["set_nodes", "set_time_steps_yearly"],
+        time_steps="set_time_steps_yearly",
+        unit_category={},
+    )
+
+@EventPublisher.register(Event.on_storage_technology_store_input_data)
+def add_variance_to_storage_technology(technology):
+    technology.variance_capex_specific_storage = technology.data_input.extract_input_data(
+        "variance_capex_specific_storage",
+        index_sets=["set_nodes", "set_time_steps_yearly"],
+        time_steps="set_time_steps_yearly",
+        unit_category={},
+    )
+
+@EventPublisher.register(Event.on_transport_technology_store_input_data)
+def add_variance_to_transport_technology(technology):
+    technology.variance_capex_specific_transport = technology.data_input.extract_input_data(
+        "variance_capex_specific_transport",
+        index_sets=["set_edges", "set_time_steps_yearly"],
+        time_steps="set_time_steps_yearly",
+        unit_category={},
+    )
+
+@EventPublisher.register(Event.on_retrofitting_technology_store_input_data)
+def add_variance_to_retrofitting_technology(technology):
+    technology.variance_capex_specific_retrofitting = technology.data_input.extract_input_data(
+        "variance_capex_specific_retrofitting",
         index_sets=["set_nodes", "set_time_steps_yearly"],
         time_steps="set_time_steps_yearly",
         unit_category={},
@@ -140,6 +179,20 @@ def add_variance_parameters_to_carrier(optimization_setup, carrier_cls):
         calling_class=carrier_cls,
     )
 
+
+@EventPublisher.register(Event.on_technology_construct_params)
+def add_variance_parameters_to_technology(optimization_setup, technology_cls):
+    optimization_setup.parameters.add_parameter(
+            name="variance_opex_specific_variable",
+            index_names=[
+                "set_technologies",
+                "set_location",
+                "set_time_steps_operation",
+            ],
+            doc="Variance of specific opex of technologies",
+            calling_class=technology_cls,
+        )
+
 @EventPublisher.register(Event.on_conversion_technology_construct_params)
 def add_variance_parameters_to_conversion_technology(optimization_setup, technology_cls):
     optimization_setup.parameters.add_parameter(
@@ -153,230 +206,54 @@ def add_variance_parameters_to_conversion_technology(optimization_setup, technol
             calling_class=technology_cls,
         )
 
+@EventPublisher.register(Event.on_storage_technology_construct_params)
+def add_variance_parameters_to_storage_technology(optimization_setup, technology_cls):
+    optimization_setup.parameters.add_parameter(
+            name="variance_capex_specific_storage",
+            index_names=[
+                "set_storage_technologies",
+                "set_nodes",
+                "set_time_steps_yearly",
+            ],
+            doc="Variance of specific capex of storage technologies",
+            calling_class=technology_cls,
+        )
 
-#
-#
-# class Variance(Element):
-#     """Class defining a generic variance as a parameter."""
-#
-#     label = "variances"
-#
-#     def __init__(self, name, optimization_setup):
-#         """Initialization of a generic variance object.
-#
-#         :param carrier: placeholder for variance that is added to the model
-#         :param optimization_setup: The OptimizationSetup the element is part of
-#         """
-#         super().__init__(name, optimization_setup)
-#         self.raw_time_series = dict()
-#
-#     def get_input_path(self):
-#         """Get input path where input data is stored input_path."""
-#         # get technology type
-#         class_label = self.label
-#         # get path dictionary
-#         paths = self.optimization_setup.paths
-#         # get input path for current class_label
-#         self.input_path = Path(paths[class_label]["folder"])
-#
-#     def store_input_data(self):
-#         """Retrieves and stores input data for element as attributes. Each Child class
-#         overwrites method to store different attributes.
-#         """
-#         # store scenario dict
-#         super().store_scenario_dict()
-#
-#         self.raw_time_series = dict()
-#         self._read_variances()
-#
-#     @classmethod
-#     def _construct_param(cls, optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter):
-#         """Constructs a parameter for the optimization model. Each Child class overwrites
-#         method to construct different parameters.
-#         """
-#         parameters = optimization_setup.parameters
-#
-#         def get_parameter_data(par_name, par_index_names):
-#             if len(par_index_names) > 0:
-#                 custom_set, index_list = cls.create_custom_set(par_index_names, optimization_setup)
-#             else:
-#                 index_list = []
-#             component_data, dict_of_units, attribute_is_series = (
-#                 optimization_setup.get_attribute_of_all_elements(
-#                     cls,
-#                     par_name,
-#                     capacity_types=False,
-#                     return_attribute_is_series=True,
-#                 )
-#             )
-#             return component_data["Variance"], index_list
-#
-#         data, index_list = get_parameter_data(par_name, par_index_names)
-#         # data_temp = copy.copy(data)
-#         relative_variance_xr = optimization_setup.parameters.convert_to_xarr(data, index_list)
-#
-#         par_values = (relative_variance_xr * corresponding_parameter).where(
-#             ~np.isinf(corresponding_parameter),
-#             np.inf
+@EventPublisher.register(Event.on_transport_technology_construct_params)
+def add_variance_parameters_to_transport_technology(optimization_setup, technology_cls):
+    optimization_setup.parameters.add_parameter(
+            name="variance_capex_specific_transport",
+            index_names=[
+                "set_transport_technologies",
+                "set_edges",
+                "set_time_steps_yearly",
+            ],
+            doc="Variance of specific capex of transport technologies",
+            calling_class=technology_cls,
+        )
+
+# @EventPublisher.register(Event.on_retrofit_technology_construct_params)
+# def add_variance_parameters_to_retrofitting_technology(optimization_setup, technology_cls):
+#     optimization_setup.parameters.add_parameter(
+#             name="variance_capex_specific_retrofitting",
+#             index_names=[
+#                 "set_retrofitting_technologies",
+#                 "set_nodes",
+#                 "set_time_steps_yearly",
+#             ],
+#             doc="Variance of specific capex of retrofitting technologies",
+#             calling_class=technology_cls,
 #         )
-#         parameters.add_parameter(
-#             name=par_name,
-#             index_names=par_index_names,
-#             doc=par_doc,
-#             data=par_values,
-#             calling_class=cls,
-#         )
-#
-#
-#     @classmethod
-#     def construct_params(cls, optimization_setup):
-#         """Constructs parameters for the optimization model. Each Child class overwrites
-#         method to construct different parameters.
-#         """
-#
-#         par_name = "variance_price_export"
-#         par_index_names = ["set_carriers", "set_nodes", "set_time_steps_operation"]
-#         par_doc = "Variance of price for export"
-#         corresponding_parameter = optimization_setup.parameters.price_export
-#         cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         par_name = "variance_price_import"
-#         par_index_names = ["set_carriers", "set_nodes", "set_time_steps_operation"]
-#         par_doc = "Variance of price for import"
-#         corresponding_parameter = optimization_setup.parameters.price_import
-#         cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         par_name = "variance_price_shed_demand"
-#         par_index_names = ["set_carriers"]
-#         par_doc = "Variance of price to shed demand"
-#         corresponding_parameter = optimization_setup.parameters.price_shed_demand
-#         cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         par_name = "variance_price_carbon_emissions"
-#         par_index_names = ["set_time_steps_yearly"]
-#         par_doc = "variance of price for carbon emissions"
-#         corresponding_parameter = optimization_setup.parameters.price_carbon_emissions
-#         cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         if len(optimization_setup.sets["set_conversion_technologies"]) > 0:
-#             par_name = "variance_capex_specific_conversion"
-#             par_index_names = ["set_conversion_technologies", "set_nodes", "set_time_steps_yearly"]
-#             par_doc = "variance of capex of conversion technologies"
-#             corresponding_parameter = optimization_setup.parameters.capex_specific_conversion
-#             cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         if len(optimization_setup.sets["set_storage_technologies"]) > 0:
-#             par_name = "variance_capex_specific_storage"
-#             par_index_names = ["set_storage_technologies", "set_nodes", "set_time_steps_yearly"]
-#             par_doc = "variance of capex of storage technologies"
-#             corresponding_parameter = optimization_setup.parameters.capex_specific_storage
-#             cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         if len(optimization_setup.sets["set_transport_technologies"]) > 0:
-#             par_name = "variance_capex_specific_transport"
-#             par_index_names = ["set_transport_technologies", "set_edges", "set_time_steps_yearly"]
-#             par_doc = "variance of capex of transport technologies"
-#             corresponding_parameter = optimization_setup.parameters.capex_specific_transport
-#             cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#         # par_name = "variance_opex_specific_variable"
-#         # par_index_names = ["set_technologies", "set_location", "set_time_steps_operation"]
-#         # par_doc = "variance of capex of technologies"
-#         # corresponding_parameter = optimization_setup.parameters.opex_specific_variable
-#         # cls._construct_param(optimization_setup, par_name, par_index_names, par_doc, corresponding_parameter)
-#
-#     def _read_variances(self):
-#         self.variance_price_export = self.data_input.extract_input_data(
-#             "variance_price_export",
-#             index_sets=[],
-#             unit_category={},
-#         )
-#
-#         self.variance_price_import = self.data_input.extract_input_data(
-#             "variance_price_import",
-#             index_sets=[],
-#             unit_category={},
-#         )
-#
-#         self.variance_price_shed_demand = self.data_input.extract_input_data(
-#             "variance_price_shed_demand",
-#             index_sets=[],
-#             unit_category={},
-#         )
-#
+
+
+
+
 #         self.variance_price_carbon_emissions = self.data_input.extract_input_data(
 #             "variance_price_carbon_emissions",
 #             index_sets=[],
 #             unit_category={},
 #         )
 #
-#         self.variance_capex_specific_conversion = self.data_input.extract_input_data(
-#             "variance_capex_specific_conversion",
-#             index_sets=[],
-#             unit_category={},
-#         )
-#
-#         self.variance_capex_specific_storage = self.data_input.extract_input_data(
-#             "variance_capex_specific_storage",
-#             index_sets=[],
-#             unit_category={},
-#         )
-#
-#         self.variance_capex_specific_transport = self.data_input.extract_input_data(
-#             "variance_capex_specific_transport",
-#             index_sets=[],
-#             unit_category={},
-#         )
-        #
-        # self.raw_time_series["variance_price_export"] = self.data_input.extract_input_data(
-        #     "variance_price_export",
-        #     index_sets=["set_carriers", "set_nodes", "set_time_steps"],
-        #     time_steps="set_base_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.raw_time_series["variance_price_import"] = self.data_input.extract_input_data(
-        #     "variance_price_import",
-        #     index_sets=["set_carriers", "set_nodes", "set_time_steps"],
-        #     time_steps="set_base_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.variance_price_shed_demand = self.data_input.extract_input_data(
-        #     "variance_price_shed_demand",
-        #     index_sets=["set_carriers"],
-        #     time_steps="set_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.variance_price_carbon_emissions = self.data_input.extract_input_data(
-        #     "variance_price_carbon_emissions",
-        #     index_sets=["set_time_steps_yearly"],
-        #     time_steps="set_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.variance_capex_specific_conversion = self.data_input.extract_input_data(
-        #     "variance_capex_specific_conversion",
-        #     index_sets=["set_conversion_technologies", "set_nodes", "set_time_steps_yearly"],
-        #     time_steps="set_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.variance_capex_specific_storage = self.data_input.extract_input_data(
-        #     "variance_capex_specific_storage",
-        #     index_sets=["set_storage_technologies", "set_nodes", "set_time_steps_yearly"],
-        #     time_steps="set_time_steps_yearly",
-        #     unit_category={},
-        # )
-        #
-        # self.variance_capex_specific_transport = self.data_input.extract_input_data(
-        #     "variance_capex_specific_transport",
-        #     index_sets=["set_transport_technologies", "set_edges", "set_time_steps_yearly"],
-        #     time_steps="set_time_steps_yearly",
-        #     unit_category={},
-        # )
-
         # self.variance_opex_specific_variable = self.data_input.extract_input_data(
         #     "variance_opex_specific_variable",
         #     index_sets=["set_technologies", "set_location", "set_time_steps_operation"],
@@ -393,67 +270,252 @@ class VarianceRules(GenericRule):
         """
         super().__init__(optimization_setup)
 
+    def _construct_import_term(self):
+        return (self.parameters.variance_price_import * self.parameters.price_import * self.variables["flow_import"] * self.variables["flow_import"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+
+    def _construct_export_term(self):
+        return (self.parameters.variance_price_import * self.parameters.price_export * self.variables["flow_export"] * self.variables["flow_export"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+
+    def _construct_demand_shedding_term(self):
+        # replace inf with large number
+        param = self.parameters.price_shed_demand
+        price_shed_demand = param.where(
+            np.isfinite(param), 1e6
+        )
+
+        return (self.parameters.variance_price_shed_demand * price_shed_demand * self.variables["shed_demand"] * self.variables["shed_demand"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+
+    def _construct_conversion_capex_technology_term(self):
+        # Capex variance
+        techs = self.sets["set_conversion_technologies"]
+        nodes = self.sets["set_nodes"]
+        capacity_addition = self.variables["capacity_addition"].rename(
+            {
+                "set_technologies": "set_conversion_technologies",
+                "set_location": "set_nodes",
+            }
+        )
+        capacity_addition = capacity_addition.sel({"set_nodes": nodes, "set_conversion_technologies": techs})
+
+
+
+        capex_specific_conversion = self.parameters.capex_specific_conversion
+        capex_specific_conversion = capex_specific_conversion.rename(
+            {
+                old: new
+                for old, new in zip(
+                list(capex_specific_conversion.dims),
+                [
+                    "set_conversion_technologies",
+                    "set_nodes",
+                    "set_time_steps_yearly",
+                ],
+                strict=False,
+            )
+            }
+        )
+        term_variance_capex = (
+                    self.parameters.variance_capex_specific_conversion * capex_specific_conversion * capacity_addition * capacity_addition).sum(
+            ["set_conversion_technologies", "set_nodes", "set_capacity_types"])
+
+        return term_variance_capex
+
+
+    def _construct_conversion_opex_technology_term(self):
+        # Opex variance
+        techs = self.sets["set_conversion_technologies"]
+        nodes = self.sets["set_nodes"]
+        opex_parameter = self.parameters.opex_specific_variable.rename(
+            {
+                "set_technologies": "set_conversion_technologies",
+                "set_location": "set_nodes",
+            }
+        )
+        variance_opex = self.parameters.variance_opex_specific_variable.rename(
+            {
+                "set_technologies": "set_conversion_technologies",
+                "set_location": "set_nodes",
+            }
+        )
+
+
+        terms = []
+        for t in techs:
+            rc = self.sets["set_reference_carriers"][t][0]
+            if rc in self.sets["set_input_carriers"][t]:
+                terms.append(
+                    opex_parameter.loc[t, nodes] * variance_opex.loc[t, nodes] * self.variables["flow_conversion_input"].loc[t, rc, nodes, :] * self.variables["flow_conversion_input"].loc[t, rc, nodes, :]
+                )
+            else:
+                terms.append(
+                    opex_parameter.loc[t, nodes] * variance_opex.loc[t, nodes] * self.variables["flow_conversion_output"].loc[t, rc, nodes, :] * self.variables["flow_conversion_output"].loc[t, rc, nodes, :]
+                )
+        expression = lp.merge(
+            terms,
+            dim="set_conversion_technologies",
+            join="outer",
+            coords="minimal",
+            compat="override",
+        )
+
+        term_variance_opex = (expression).sum(["set_conversion_technologies", "set_nodes", "set_time_steps_operation"])
+
+        return term_variance_opex
+
+    def _construct_storage_capex_technology_term(self):
+        techs = self.sets["set_storage_technologies"]
+        nodes = self.sets["set_nodes"]
+        if len(techs) == 0:
+            return 0
+        else:
+            # Capex variance
+            capacity_addition = self.variables["capacity_addition"].rename(
+                {
+                    "set_technologies": "set_storage_technologies",
+                    "set_location": "set_nodes",
+                }
+            )
+            capacity_addition = capacity_addition.sel({"set_nodes": nodes, "set_storage_technologies": techs})
+            term_variance_capex = (self.parameters.variance_capex_specific_storage * self.parameters.capex_specific_storage * capacity_addition * capacity_addition).sum(["set_storage_technologies", "set_nodes", "set_capacity_types"])
+            return term_variance_capex
+
+
+    def _construct_storage_opex_technology_term(self):
+        techs = self.sets["set_storage_technologies"]
+        nodes = self.sets["set_nodes"]
+        if len(techs) == 0:
+            return 0
+        else:
+            # Opex variance
+            opex_parameter = self.parameters.opex_specific_variable.sel({"set_technologies": techs, "set_location": nodes}).rename(
+                {
+                    "set_technologies": "set_storage_technologies",
+                    "set_location": "set_nodes",
+                }
+            )
+            variance_opex = self.parameters.variance_opex_specific_variable.sel({"set_technologies": techs, "set_location": nodes}).rename(
+                {
+                    "set_technologies": "set_storage_technologies",
+                    "set_location": "set_nodes",
+                }
+            )
+            flow_charge = self.variables["flow_storage_charge"].sel({"set_storage_technologies": techs, "set_nodes": nodes})
+            flow_discharge = self.variables["flow_storage_discharge"].sel({"set_storage_technologies": techs, "set_nodes": nodes})
+
+            expression = variance_opex * opex_parameter * flow_charge * flow_charge +  variance_opex * opex_parameter * flow_discharge * flow_discharge
+            term_variance_opex = expression.sum(["set_storage_technologies", "set_nodes", "set_time_steps_operation"])
+            return term_variance_opex
+
+    def _construct_transport_capex_technology_term(self):
+        techs = self.sets["set_transport_technologies"]
+        edges = self.sets["set_edges"]
+        if len(techs) == 0:
+            return 0
+        else:
+            # Capex variance
+            capacity_type = "power"
+            capacity_addition = self.variables["capacity_addition"].rename(
+                {
+                    "set_technologies": "set_transport_technologies",
+                    "set_location": "set_edges",
+                }
+            )
+            capacity_addition = capacity_addition.sel(
+                {"set_edges": edges, "set_transport_technologies": techs, "set_capacity_types": capacity_type})
+
+            term_variance_capex = (self.parameters.variance_capex_specific_transport * self.parameters.capex_specific_transport * capacity_addition * capacity_addition).sum(["set_transport_technologies", "set_edges"])
+            return term_variance_capex
+
+    def _construct_transport_opex_technology_term(self):
+        techs = self.sets["set_transport_technologies"]
+        edges = self.sets["set_edges"]
+        if len(techs) == 0:
+            return 0
+        else:
+            # Opex variance
+            opex_parameter = self.parameters.opex_specific_variable.sel({"set_technologies": techs, "set_location": edges}).rename(
+                {
+                    "set_technologies": "set_transport_technologies",
+                    "set_location": "set_edges",
+                }
+            )
+            variance_opex = self.parameters.variance_opex_specific_variable.sel({"set_technologies": techs, "set_location": edges}).rename(
+                {
+                    "set_technologies": "set_transport_technologies",
+                    "set_location": "set_edges",
+                }
+            )
+            flow = self.variables["flow_transport"].sel({"set_transport_technologies": techs, "set_edges": edges})
+            expression = variance_opex * opex_parameter * flow * flow
+            term_variance_opex = expression.sum(["set_transport_technologies", "set_edges", "set_time_steps_operation"])
+
+            return term_variance_opex
+
+    def _construct_capex_term(self):
+        term_capex_variance_conversion_techs = self._construct_conversion_capex_technology_term()
+        term_capex_variance_storage_techs = self._construct_storage_capex_technology_term()
+        term_capex_variance_transport_techs = self._construct_transport_capex_technology_term()
+
+        return term_capex_variance_conversion_techs + term_capex_variance_storage_techs + term_capex_variance_transport_techs
+
+    def _construct_opex_term(self):
+        term_opex_variance_conversion_techs = self._construct_conversion_opex_technology_term()
+        term_opex_variance_storage_techs = self._construct_storage_opex_technology_term()
+        term_opex_variance_transport_techs = self._construct_transport_opex_technology_term()
+
+        return term_opex_variance_conversion_techs + term_opex_variance_storage_techs + term_opex_variance_transport_techs
+
     def constraint_variance_term(self):
         """
         Defines an objective function optimizing the mean-variance formulation.
 
         Todo:
             - Implement covariances between variables
+            - Implement retrofitting technologies
 
         """
         weighting_factor = config.get("weighting_factor")
 
         #Import/export variances
-        term_variance_import = (self.parameters.variance_price_import * self.parameters.price_import * self.variables["flow_import"] * self.variables["flow_import"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
-        term_variance_export = (self.parameters.variance_price_import * self.parameters.price_export * self.variables["flow_export"] * self.variables["flow_export"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+        if "import" in config.get("include_variances_for"):
+            term_variance_import = self._construct_import_term()
+        else:
+            term_variance_import = 0
 
-        # Shed demand variance
-        # replace inf with large number
-        param = self.parameters.price_shed_demand
-        price_shed_demand = param.where(
-            np.isfinite(param), 1e6
-        )
-        term_variance_demand_shedding = (self.parameters.variance_price_shed_demand * price_shed_demand * self.variables["shed_demand"] * self.variables["shed_demand"]).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+        if "export" in config.get("include_variances_for"):
+            term_variance_export = self._construct_export_term()
+        else:
+            term_variance_export = 0
+
+        # Shed demand variances
+        if "demand_shedding" in config.get("include_variances_for"):
+            term_variance_demand_shedding = self._construct_demand_shedding_term()
+        else:
+            term_variance_demand_shedding = 0
+
+        # technology capex variances
+        if "capex" in config.get("include_variances_for"):
+            term_variances_capex = self._construct_capex_term()
+        else:
+            term_variances_capex = 0
+
+        # technology opex variances
+        if "opex" in config.get("include_variances_for"):
+            term_variances_opex = self._construct_capex_term()
+        else:
+            term_variances_opex = 0
+
 
         # Carbon emission variance
         # term_variance_carbon_emissions = self.parameters.variance_price_carbon_emissions * self.variables["carbon_emissions_annual"] * self.variables["carbon_emissions_annual"]
-
-        # Capex variance conversion technologies
-        capex_specific_conversion = self.parameters.capex_specific_conversion
-        capex_specific_conversion = capex_specific_conversion.rename(
-            {
-                old: new
-                for old, new in zip(
-                    list(capex_specific_conversion.dims),
-                    [
-                        "set_conversion_technologies",
-                        "set_nodes",
-                        "set_time_steps_yearly",
-                    ],
-                    strict=False,
-                )
-            }
-        )
-        term_variance_capex_conversion = (self.parameters.variance_capex_specific_conversion * capex_specific_conversion * self.variables["capacity_approximation"] * self.variables["capacity_approximation"]).sum(["set_conversion_technologies", "set_nodes"])
-
-        # if len(self.sets["set_storage_technologies"]) > 0:
-        #     term_variance_capex_storage = (self.parameters.variance_capex_specific_storage * self.variables["capacity_addition"] * self.variables["capacity_addition"]).sum(["set_storage_technologies", "set_nodes", "set_time_steps_yearly"])
-        # else:
-        #     term_variance_capex_storage = 0
-        #
-        # if len(self.sets["set_transport_technologies"]) > 0:
-        #     term_variance_capex_transport = (self.parameters.variance_capex_specific_transport * self.variables["capacity_addition"] * self.variables["capacity_addition"]).sum(["set_transport_technologies", "set_edges", "set_time_steps_yearly"])
-        # else:
-        #     term_variance_capex_transport = 0
 
         variance_term = (
                        term_variance_import +
                        term_variance_export +
                        term_variance_demand_shedding +
+                       term_variances_capex +
+                       term_variances_opex
                        # term_variance_carbon_emissions +
-                       term_variance_capex_conversion
-                       # term_variance_capex_storage +
-                       # term_variance_capex_transport
                ).sum("set_time_steps_yearly")
 
         npv_term = self.variables["net_present_cost"].sum("set_time_steps_yearly")
