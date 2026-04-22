@@ -9,6 +9,7 @@ import xarray as xr
 from ..component import IndexSet
 from ..element import Element, GenericRule
 from .technology import Technology
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class TransportTechnology(Technology):
@@ -40,6 +41,9 @@ class TransportTechnology(Technology):
         """
         # get attributes from class <Technology>
         super().store_input_data()
+
+        EventPublisher.trigger(Event.on_transport_technology_store_input_data, self)
+
         # set attributes for parameters of child class <TransportTechnology>
         self.distance = self.data_input.extract_input_data(
             "distance", index_sets=["set_edges"], unit_category={"distance": 1}
@@ -235,6 +239,9 @@ class TransportTechnology(Technology):
 
         :param optimization_setup: The OptimizationSetup the element is part of
         """
+
+        EventPublisher.trigger(Event.on_transport_technology_construct_params, optimization_setup=optimization_setup, technology_cls=cls)
+
         # distance between nodes
         optimization_setup.parameters.add_parameter(
             name="distance",

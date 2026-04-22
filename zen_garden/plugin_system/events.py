@@ -37,10 +37,26 @@ class Event(Enum):
     test_event1 = auto()
     test_event2 = auto()
     on_preprocessing = auto()
+
+    # Store input data events
+    on_energy_system_store_input_data = auto()
     on_carrier_store_input_data = auto()
+    on_technology_store_input_data = auto()
     on_conversion_technology_store_input_data = auto()
+    on_storage_technology_store_input_data = auto()
+    on_transport_technology_store_input_data = auto()
+    on_retrofitting_technology_store_input_data = auto()
+
+    # Parameter contruction events
+    on_energy_system_construct_params = auto()
+    on_technology_construct_params = auto()
     on_carrier_construct_params = auto()
     on_conversion_technology_construct_params = auto()
+    on_storage_technology_construct_params = auto()
+    on_transport_technology_construct_params = auto()
+    on_retrofit_technology_construct_params = auto()
+
+
     after_model_construction = auto()
 
 

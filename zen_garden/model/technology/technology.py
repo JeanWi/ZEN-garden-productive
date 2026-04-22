@@ -12,6 +12,7 @@ import pandas as pd
 import xarray as xr
 from linopy.expressions import LinearExpression
 
+from zen_garden.plugin_system.events import Event, EventPublisher
 from ..component import IndexSet, ZenIndex
 from ..element import Element, GenericRule
 
@@ -45,6 +46,9 @@ class Technology(Element):
         """
         # store scenario dict
         super().store_scenario_dict()
+
+        self.raw_time_series = {}
+        EventPublisher.trigger(Event.on_technology_store_input_data, self)
         # set attributes of technology
         set_location = self.location_type
         self.capacity_addition_min = self.data_input.extract_input_data(
@@ -89,7 +93,6 @@ class Technology(Element):
         )
 
         # add all raw time series to dict
-        self.raw_time_series = {}
         self.raw_time_series["min_load"] = self.data_input.extract_input_data(
             "min_load",
             index_sets=[set_location, "set_time_steps"],
@@ -503,7 +506,7 @@ class Technology(Element):
         :param optimization_setup: The OptimizationSetup
         """
         # construct pe.Param of the class <Technology>
-
+        EventPublisher.trigger(Event.on_technology_construct_params, optimization_setup=optimization_setup, technology_cls=cls)
         # existing capacity
         optimization_setup.parameters.add_parameter(
             name="capacity_existing",

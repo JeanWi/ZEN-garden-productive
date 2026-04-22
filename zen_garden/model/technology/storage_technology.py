@@ -11,6 +11,7 @@ from zen_garden.utils import linexpr_from_tuple_np
 from ..component import IndexSet
 from ..element import Element, GenericRule
 from .technology import Technology
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class StorageTechnology(Technology):
@@ -42,6 +43,9 @@ class StorageTechnology(Technology):
         """
         # get attributes from class <Technology>
         super().store_input_data()
+
+        EventPublisher.trigger(Event.on_storage_technology_store_input_data, self)
+
         # set attributes for parameters of child class <StorageTechnology>
         self.efficiency_charge = self.data_input.extract_input_data(
             "efficiency_charge",
@@ -180,6 +184,9 @@ class StorageTechnology(Technology):
 
         :param optimization_setup: The OptimizationSetup the element is part of
         """
+
+        EventPublisher.trigger(Event.on_storage_technology_construct_params, optimization_setup=optimization_setup, technology_cls=cls)
+
         # energy to power ratio
         optimization_setup.parameters.add_parameter(
             name="energy_to_power_ratio_min",

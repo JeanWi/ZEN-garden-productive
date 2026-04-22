@@ -15,6 +15,7 @@ import xarray as xr
 from zen_garden.model.element import GenericRule
 from zen_garden.preprocess.extract_input_data import DataInput
 from zen_garden.preprocess.unit_handling import UnitHandling
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 from .time_steps import TimeStepsDicts
 
@@ -135,6 +136,9 @@ class EnergySystem:
         self.discount_rate = self.data_input.extract_input_data(
             "discount_rate", index_sets=[], unit_category={}
         )
+
+        EventPublisher.trigger(Event.on_energy_system_store_input_data, self)
+
         # carbon emissions limit
         self.carbon_emissions_annual_limit = self.data_input.extract_input_data(
             "carbon_emissions_annual_limit",
@@ -380,6 +384,9 @@ class EnergySystem:
         """Constructs the pe.Params of the class <EnergySystem>."""
         cls = self.__class__
         parameters = self.optimization_setup.parameters
+
+        EventPublisher.trigger(Event.on_energy_system_construct_params, optimization_setup=self.optimization_setup, technology_cls=cls)
+
         # operational time step duration
         parameters.add_parameter(
             name="time_steps_operation_duration",

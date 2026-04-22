@@ -11,6 +11,7 @@ from zen_garden.utils import align_like
 
 from ..element import GenericRule
 from .conversion_technology import ConversionTechnology
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 
 class RetrofittingTechnology(ConversionTechnology):
@@ -40,6 +41,9 @@ class RetrofittingTechnology(ConversionTechnology):
         """
         # get attributes from class <Technology>
         super().store_input_data()
+
+        EventPublisher.trigger(Event.on_retrofitting_technology_store_input_data, self)
+
         # get retrofit base technology
         self.retrofit_base_technology = (
             self.data_input.extract_retrofit_base_technology()
@@ -79,6 +83,9 @@ class RetrofittingTechnology(ConversionTechnology):
 
         :param optimization_setup: The OptimizationSetup the element is part of
         """
+
+        EventPublisher.trigger(Event.on_retrofit_technology_construct_params, optimization_setup=optimization_setup, technology_cls=cls)
+
         # slope of linearly modeled capex
         optimization_setup.parameters.add_parameter(
             name="retrofit_flow_coupling_factor",
