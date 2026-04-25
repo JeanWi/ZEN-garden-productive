@@ -37,6 +37,7 @@ class Event(Enum):
     test_event1 = auto()
     test_event2 = auto()
 
+    after_solve = auto()
 
 class EventPublisher:
     """Class to register and trigger events.
