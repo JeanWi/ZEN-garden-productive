@@ -9,6 +9,7 @@ import tsam.timeseriesaggregation as tsam
 
 from zen_garden.model.element import Element
 from zen_garden.model.energy_system import EnergySystem
+from zen_garden.preprocess.helpers import read_input_csv
 
 
 class TimeSeriesAggregation(object):
@@ -228,9 +229,9 @@ class TimeSeriesAggregation(object):
         self.excluded_ts = []
         if self.system.exclude_parameters_from_TSA:
             excluded_parameters = (
-                self.optimization_setup.energy_system.data_input.read_input_csv(
-                    "exclude_parameter_from_TSA"
-                )
+                read_input_csv(self.optimization_setup.energy_system.data_input.folder_path,
+                               "exclude_parameter_from_TSA"
+                               )
             )
             # exclude file exists
             if excluded_parameters is not None:

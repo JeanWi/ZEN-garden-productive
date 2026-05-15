@@ -18,6 +18,8 @@ from zen_garden.preprocess.unit_handling import UnitHandling
 from zen_garden.plugin_system.events import EventPublisher, Event
 
 from .time_steps import TimeStepsDicts
+from ..preprocess.helpers import calculate_haversine_distances_from_nodes, read_used_nodes, \
+    single_node_systems_check, read_edges, read_coordinates_of_used_nodes
 
 
 class EnergySystem:
@@ -72,18 +74,46 @@ class EnergySystem:
         # dict to save the parameter units (and save them in the results later on)
         self.units = {}
 
+    def _store_topography(self):
+        # Nodes
+        set_nodes = read_used_nodes(self.data_input.folder_path, self.data_input.system.set_nodes)
+        single_node_systems_check(set_nodes, self.data_input.system.set_transport_technologies)
+        self.set_nodes = set_nodes
+        self.data_input.system.set_nodes = set_nodes
+
+        # Coordinates of nodes
+        nodes_with_locations = read_coordinates_of_used_nodes(self.data_input.folder_path, set_nodes)
+
+        coords =  nodes_with_locations.set_index("node")
+        self.system.coords = coords.T.to_dict()
+
+        #Edges
+        consistency_check = self.data_input.energy_system.optimization_setup.input_data_checks.check_single_directed_edges
+        set_edges_input = read_edges(self.data_input.folder_path, self.data_input.energy_system.set_nodes, consistency_check)
+
+        set_nodes_on_edges = {}
+        for edge in set_edges_input.index:
+            set_nodes_on_edges[edge] = (
+                set_edges_input.loc[edge, "node_from"],
+                set_edges_input.loc[edge, "node_to"],
+            )
+
+        self.set_nodes_on_edges = set_nodes_on_edges
+        self.set_edges = list(self.set_nodes_on_edges.keys())
+        self.set_haversine_distances_edges = calculate_haversine_distances_from_nodes(nodes_with_locations,
+                                                                                      set_nodes_on_edges,
+                                                                                      self.unit_handling)
+
     def store_input_data(self):
         """Retrieves and stores input data for EnergySystem as attributes."""
         # store scenario dict
         self.data_input.scenario_dict = self.optimization_setup.scenario_dict
+
         # in class <EnergySystem>, all sets are constructed
-        self.set_nodes = self.data_input.extract_locations()
-        self.set_nodes_on_edges = self.calculate_edges_from_nodes()
-        self.set_edges = list(self.set_nodes_on_edges.keys())
-        self.set_haversine_distances_edges = (
-            self.calculate_haversine_distances_from_nodes()
-        )
+        self._store_topography()
+
         self.set_technologies = self.system.set_technologies
+
         # base time steps
         self.set_base_time_steps = list(
             range(
@@ -124,7 +154,7 @@ class EnergySystem:
         """ parameters whose time-dependant data should not be interpolated
             (for years without data) in the extract_input_data.py
             convert_real_to_generic_time_indices() function"""
-        self.parameters_interpolation_off = self.data_input.read_input_json(
+        self.parameters_interpolation_off = self.data_input.read_parameters_interpolation_off(
             "parameters_interpolation_off"
         )
         # technology-specific
@@ -193,64 +223,6 @@ class EnergySystem:
         self.knowledge_spillover_rate = self.data_input.extract_input_data(
             "knowledge_spillover_rate", index_sets=[], unit_category={}
         )
-
-    def calculate_edges_from_nodes(self):
-        """Calculates set_nodes_on_edges from set_nodes.
-
-        :return: set_nodes_on_edges: dict with edges and corresponding nodes
-        """
-        set_nodes_on_edges = {}
-        # read edge file
-        set_edges_input = self.data_input.extract_locations(extract_nodes=False)
-        for edge in set_edges_input.index:
-            set_nodes_on_edges[edge] = (
-                set_edges_input.loc[edge, "node_from"],
-                set_edges_input.loc[edge, "node_to"],
-            )
-        return set_nodes_on_edges
-
-    def calculate_haversine_distances_from_nodes(self):
-        """Computes the distance (in km) between two nodes.
-
-        The Haversine function is used to compute the distance in kilometers based on
-         their lon lat coordinates.
-
-        :return: dict containing all edges along with their distances
-        """
-        set_haversine_distances_of_edges = {}
-        # read coords file
-        df_coords_input = self.data_input.extract_locations(extract_coordinates=True)
-        coords = df_coords_input.set_index("node")
-        self.system.coords = coords.T.to_dict()
-        # convert coords from decimal degrees to radians
-        df_coords_input["lon"] = df_coords_input["lon"] * np.pi / 180
-        df_coords_input["lat"] = df_coords_input["lat"] * np.pi / 180
-        # Radius of the Earth in kilometers
-        radius = 6371.0
-        for edge, nodes in self.set_nodes_on_edges.items():
-            node_1, node_2 = nodes
-            coords1 = df_coords_input[df_coords_input["node"] == node_1]
-            coords2 = df_coords_input[df_coords_input["node"] == node_2]
-            # Haversine formula
-            dlon = coords2["lon"].squeeze() - coords1["lon"].squeeze()
-            dlat = coords2["lat"].squeeze() - coords1["lat"].squeeze()
-            a = (
-                np.sin(dlat / 2) ** 2
-                + np.cos(coords1["lat"].squeeze())
-                * np.cos(coords2["lat"].squeeze())
-                * np.sin(dlon / 2) ** 2
-            )
-            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-            distance = radius * c
-            set_haversine_distances_of_edges[edge] = distance
-        multiplier = self.unit_handling.get_unit_multiplier(
-            "km", attribute_name="distance"
-        )
-        set_haversine_distances_of_edges = {
-            key: value * multiplier
-            for key, value in set_haversine_distances_of_edges.items()
-        }
-        return set_haversine_distances_of_edges
 
     def set_technology_of_carrier(self, technology, list_technology_of_carrier):
         """Appends technology to carrier in dict_technology_of_carrier.

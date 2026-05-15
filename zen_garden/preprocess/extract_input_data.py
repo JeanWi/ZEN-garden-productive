@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import linregress
 
+from zen_garden.preprocess.helpers import read_attribute_json, read_input_csv
+
 
 class DataInput:
     """Class to extract input data."""
@@ -45,7 +47,8 @@ class DataInput:
         # get names of indices
         self.index_names = self.analysis.header_data_inputs
         # load attributes file
-        self.attribute_dict = self.load_attribute_file()
+        self.attribute_dict = read_attribute_json(self.folder_path)
+
         # optimization setup
         self.optimization_setup = optimization_setup
 
@@ -108,13 +111,13 @@ class DataInput:
         f_name, scenario_factor = self.scenario_dict.get_param_file(
             self.element.name, file_name
         )
-        df_input = self.read_input_csv(f_name)
+        df_input = read_input_csv(self.folder_path, f_name)
         if f_name != file_name and yearly_variation and df_input is None:
             logging.info(
                 f"{f_name} for current scenario is missing from "
                 f"{self.folder_path}. {file_name} is used as input file"
             )
-            df_input = self.read_input_csv(file_name)
+            df_input = read_input_csv(self.folder_path, file_name)
 
         assert df_input is not None or default_value is not None, (
             f"input file for attribute {file_name} could not be imported and no "
@@ -139,7 +142,7 @@ class DataInput:
                 self.element.name, file_name
             )
             if part_file_name is not None:
-                df_input_part = self.read_input_csv(part_file_name)
+                df_input_part = read_input_csv(self.folder_path, part_file_name)
                 if df_input_part is None:
                     logging.info(
                         f"{part_file_name} for current scenario is missing "
@@ -261,35 +264,7 @@ class DataInput:
         df_output_copy.loc[common_index] = df_input.loc[common_index]
         return df_output_copy
 
-    def read_input_csv(self, input_file_name):
-        """Reads input data and returns raw input dataframe.
-
-        :param input_file_name: name of selected file
-        :return: df_input: pd.DataFrame with input data
-        """
-        # append .csv suffix
-        input_file_name += ".csv"
-
-        # select data
-        file_names = os.listdir(self.folder_path)
-        if input_file_name in file_names:
-            df_input = pd.read_csv(
-                os.path.join(self.folder_path, input_file_name),
-                header=0,
-                index_col=None,
-            )
-            # check for header name duplicates (pd.read_csv() adds a dot and a
-            # number to duplicate headers)
-            if any("." in col for col in df_input.columns):
-                raise AssertionError(
-                    f"The input data file {input_file_name} at "
-                    f"{self.folder_path} contains two identical header names."
-                )
-            return df_input
-        else:
-            return None
-
-    def read_input_json(self, input_file_name):
+    def read_parameters_interpolation_off(self, input_file_name):
         """Reads json input data and returns a dict.
 
         :param input_file_name: name of selected file
@@ -304,56 +279,6 @@ class DataInput:
             return data
         else:
             return None
-
-    def load_attribute_file(self, filename="attributes"):
-        """Loads attribute file. Either as csv (old version) or json (new version)
-        :param filename: name of attributes file, default is 'attributes'
-        :return: attribute_dict.
-        """
-        if os.path.exists(self.folder_path / f"{filename}.json"):
-            attribute_dict = self._load_attribute_file_json(filename=filename)
-        # extract csv
-        elif os.path.exists(self.folder_path / f"{filename}.csv"):
-            raise NotImplementedError(
-                f"The .csv format for attributes is deprecated "
-                f"({filename} of {self.element.name}). Use .json instead."
-            )
-        else:
-            raise FileNotFoundError(
-                f"Attributes file does not exist for {self.element.name}"
-            )
-        return attribute_dict
-
-    def _load_attribute_file_json(self, filename):
-        """Loads json attributes file.
-
-        :param filename:
-        :return: attributes
-        """
-        file_path = self.folder_path / f"{filename}.json"
-        with open(file_path, "r") as file:
-            data = json.load(file)
-        attribute_dict = {}
-        if isinstance(data, list):
-            warnings.warn(
-                "The list format in attributes.json [{...}] is deprecated. "
-                "Use a dict format instead {...}.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            for item in data:
-                for k, v in item.items():
-                    if isinstance(v, list):
-                        attribute_dict[k] = {sk: sv for d in v for sk, sv in d.items()}
-                    else:
-                        attribute_dict[k] = v
-        else:
-            for k, v in data.items():
-                if isinstance(v, list):
-                    attribute_dict[k] = {sk: sv for d in v for sk, sv in d.items()}
-                else:
-                    attribute_dict[k] = v
-        return attribute_dict
 
     def get_attribute_dict(self, attribute_name):
         """Get attribute dict and factor for attribute.
@@ -370,7 +295,7 @@ class DataInput:
             filename = "attributes"
             factor = 1
         if filename != "attributes":
-            attribute_dict = self.load_attribute_file(filename)
+            attribute_dict = read_attribute_json(self.folder_path, filename)
         else:
             attribute_dict = self.attribute_dict
         return attribute_dict, factor
@@ -568,7 +493,7 @@ class DataInput:
                     f_name, scenario_factor = self.scenario_dict.get_param_file(
                         self.element.name, filename
                     )
-                    df_input = self.read_input_csv(f_name)
+                    df_input = read_input_csv(self.folder_path, f_name)
                     if df_input is not None and not df_input.empty:
                         # get subelement dataframe
                         if subelement is not None and subelement in df_input.columns:
@@ -613,13 +538,13 @@ class DataInput:
         f_name, scenario_factor = self.scenario_dict.get_param_file(
             self.element.name, file_name
         )
-        df_input = self.read_input_csv(f_name)
+        df_input = read_input_csv(self.folder_path, f_name)
         if f_name != file_name and df_input is None:
             logging.info(
                 f"{f_name} is missing from {self.folder_path}. {file_name} is "
                 "used as input file"
             )
-            df_input = self.read_input_csv(file_name)
+            df_input = read_input_csv(self.folder_path, file_name)
         if df_input is not None:
             df_output, default_value, index_name_list = self.create_default_output(
                 index_sets,
@@ -640,68 +565,6 @@ class DataInput:
             # apply the scenario_factor
             df_output = df_output * scenario_factor
             setattr(self, name_yearly_variation, df_output)
-
-    def extract_locations(self, extract_nodes=True, extract_coordinates=False):
-        """Reads input data to extract nodes or edges.
-
-        Args
-            extract_nodes: boolean to switch between nodes and edges \n
-            extract_coordinates: boolean to switch between nodes and
-            nodes + coordinates
-        """
-        if extract_nodes:
-            set_nodes_config = self.system.set_nodes
-            df_nodes_w_coords = self.read_input_csv("set_nodes")
-            if extract_coordinates:
-                if len(set_nodes_config) != 0:
-                    df_nodes_w_coords = df_nodes_w_coords[
-                        df_nodes_w_coords["node"].isin(set_nodes_config)
-                    ]
-                return df_nodes_w_coords
-            else:
-                set_nodes_input = df_nodes_w_coords["node"].to_list()
-                # if no nodes specified in system, use all nodes
-                if len(set_nodes_config) == 0 and not len(set_nodes_input) == 0:
-                    self.system.set_nodes = set_nodes_input
-                    set_nodes_config = set_nodes_input
-                else:
-                    missing_nodes = list(
-                        set(set_nodes_config).difference(set_nodes_input)
-                    )
-                    assert len(missing_nodes) == 0, (
-                        f"The nodes {missing_nodes} were declared in the "
-                        "config but do not exist in the input file "
-                        f"{os.path.join(self.folder_path, 'set_nodes')}"
-                    )
-                if not isinstance(set_nodes_config, list):
-                    set_nodes_config = set_nodes_config.to_list()
-                set_nodes_config.sort()
-                # assert that no transport technology is selected if only
-                # one node is given
-                assert (
-                    len(set_nodes_config) > 1
-                    or len(self.system.set_transport_technologies) == 0
-                ), (
-                    f"Only one node is given in the system file. "
-                    f"Transport technologies are not allowed in this case. "
-                    f"You selected {self.system.set_transport_technologies}"
-                )
-                return set_nodes_config
-        else:
-            set_edges_input = self.read_input_csv("set_edges")
-            input_checks = self.energy_system.optimization_setup.input_data_checks
-            input_checks.check_single_directed_edges(set_edges_input=set_edges_input)
-            if set_edges_input is not None:
-                set_edges = set_edges_input[
-                    (set_edges_input["node_from"].isin(self.energy_system.set_nodes))
-                    & (set_edges_input["node_to"].isin(self.energy_system.set_nodes))
-                ]
-                set_edges = set_edges.set_index("edge")
-                return set_edges
-            else:
-                raise FileNotFoundError(
-                    f"Input file set_edges.csv is missing from {self.folder_path}"
-                )
 
     def extract_carriers(self, carrier_type):
         """Reads input data and extracts conversion carriers.
@@ -767,7 +630,7 @@ class DataInput:
             f_name, _ = self.scenario_dict.get_param_file(
                 self.element.name, f"capacity_existing{_energy_string}"
             )
-            df_input = self.read_input_csv(f_name)
+            df_input = read_input_csv(self.folder_path, f_name)
             if df_input is None:
                 return [0]
             if self.element.name in self.system.set_transport_technologies:
@@ -801,7 +664,7 @@ class DataInput:
             self.element.name, file_name
         )
         if f"{f_name}.csv" in os.listdir(self.folder_path):
-            df_input = self.read_input_csv(f_name)
+            df_input = read_input_csv(self.folder_path, f_name)
             # fill output dataframe
             df_output = self.extract_general_input_data(
                 df_input,
@@ -968,7 +831,7 @@ class DataInput:
 
         :return: df_input: raw input file
         """
-        df_input = self.read_input_csv("nonlinear_capex")
+        df_input = read_input_csv(self.folder_path, "nonlinear_capex")
         has_unit = False
         if df_input is not None:
             string_row = (
