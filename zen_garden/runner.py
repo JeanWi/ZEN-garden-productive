@@ -19,9 +19,6 @@ from .utils import InputDataChecks, ScenarioUtils, StringUtils, setup_logger
 
 from zen_garden.plugin_system.events import Event, EventPublisher
 
-#import numpy as np
-#import xarray as xr
-
 # we setup the logger here
 setup_logger()
 
@@ -185,15 +182,21 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
                 param_map=param_map,
             )
 
-    EventPublisher.trigger( # Bei multi scenario runs, hätte nur das letzte mga?
-        Event.after_solve,
-        optimization_setup=optimization_setup,
-        scenarios=config.scenarios,
-        subfolder=subfolder,
-        model_name=model_name,
-        scenario_name=scenario_name,
-        param_map=param_map,
-    )
+        # Fire after_solve once per scenario, only if its baseline solve
+        # was optimal. Placed after the step loop so each scenario gets
+        # its own MGA/ORACLE pass with that scenario's postprocess context.
+        # An infeasible scenario breaks the step loop early, leaving
+        # optimality False, so the guard skips it.
+        if optimization_setup.optimality:
+            EventPublisher.trigger(
+                Event.after_solve,
+                optimization_setup=optimization_setup,
+                scenarios=config.scenarios,
+                subfolder=subfolder,
+                model_name=model_name,
+                scenario_name=scenario_name,
+                param_map=param_map,
+            )
 
     logging.info("--- Optimization finished ---")
     return optimization_setup
