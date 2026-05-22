@@ -1058,7 +1058,7 @@ class Technology(Element):
         rules.constraint_technology_lifetime()
 
         # limit diffusion rate
-        rules.constraint_technology_diffusion_limit()
+        # rules.constraint_technology_diffusion_limit()
 
         # annual capex of having capacity
         rules.constraint_cost_capex_yearly()

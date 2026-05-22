@@ -160,7 +160,7 @@ class Solver(Subscriptable):
     This defines for example the solver options, scaling, etc.
     """
 
-    name: str = "highs"
+    name: str = "gurobi"
     solver_options: dict = {}
     check_unit_consistency: bool = True
     solver_dir: str = ".//outputs//solver_files"

@@ -11,8 +11,8 @@ from openpyxl.formatting.rule import ColorScaleRule
 root_path =  Path("C:/Users/jwiegner/OneDrive - ETH Zurich/00_Papers_Journal/00_2026-Quadratic terms in ESM")
 cost_data_path = root_path / Path("ZEN_garden_assumptions/assumptions_technologies_cost_uncertainty.xlsx")
 technology_data_path = root_path / Path("ZEN_garden_assumptions/raw/assumptions_technologies_full.xlsx")
-PRIMARY_WEIGHT = 0.6
-SECONDARY_WEIGHT = 0.3
+PRIMARY_CORRELATION = 0.9
+SECONDARY_CORRELATION = 0.3
 MIN_CORRELATION = 0.0
 MAX_NUMBER_OF_SIMILAR_CARRIERS = 5
 
@@ -143,63 +143,46 @@ correlation_matrix = pd.DataFrame(
     columns=technologies
 )
 
-# =============================================================================
-# 4) CALCULATE PAIRWISE WEIGHTED KEYWORD SIMILARITY
-# =============================================================================
-for tech_i in technologies:
-    for tech_j in technologies:
-        # Skip diagonal
-        if tech_i == tech_j:
-            continue
-        score = 0.0
-        # ---------------------------------------------------------------------
-        # Primary technology class
-        # ---------------------------------------------------------------------
-        if classification_df.loc[tech_i, 'Primary technology class'][0] == "Other":
-            pass
-        elif (
-            classification_df.loc[tech_i, 'Primary technology class'][0]
-            ==
-            classification_df.loc[tech_j, 'Primary technology class'][0]
-        ):
-            score += PRIMARY_WEIGHT
+classification_df.columns = classification_df.columns.droplevel(1)
+# Primary
+primary_dummies = pd.get_dummies(classification_df["Primary technology class"]).astype(float)
+primary_dummies = primary_dummies * PRIMARY_CORRELATION          # scale to correlation value
 
-        # ---------------------------------------------------------------------
-        # Secondary input class
-        # ---------------------------------------------------------------------
-        print(tech_i, tech_j)
-        all_carriers = set(classification_df.loc[tech_i, 'Secondary technology class'][0] + classification_df.loc[tech_j, 'Secondary technology class'][0])
-        carriers_present_in_both = set(classification_df.loc[tech_i, 'Secondary technology class'][0]) & set(classification_df.loc[tech_j, 'Secondary technology class'][0])
+all_carriers = sorted({
+    c
+    for carriers in classification_df["Secondary technology class"]
+    for c in (carriers if isinstance(carriers, list) else [])
+})
 
-        print(len(carriers_present_in_both))
+# Secondary
+secondary_dummies = pd.DataFrame(0.0, index=technologies, columns=all_carriers)
+for tech in technologies:
+    carriers = classification_df.loc[tech, "Secondary technology class"]
+    if isinstance(carriers, list):
+        for c in carriers:
+            if c in secondary_dummies.columns:
+                secondary_dummies.loc[tech, c] = SECONDARY_CORRELATION
 
-        if len(carriers_present_in_both) != 0:
-            secondary_score = (0.5 + 0.1 * len(carriers_present_in_both))*SECONDARY_WEIGHT
+classification_df_dummies = pd.concat([primary_dummies, secondary_dummies], axis=1)
 
-            score += secondary_score
-        #
-        # if use_number_of_carriers_only:
-        #     print(len(carriers_present_in_both))
-        #     print(len(carriers_present_in_both)/MAX_NUMBER_OF_SIMILAR_CARRIERS)
-        #     print(len(carriers_present_in_both)/MAX_NUMBER_OF_SIMILAR_CARRIERS * SECONDARY_WEIGHT)
-        #     score += len(carriers_present_in_both)/MAX_NUMBER_OF_SIMILAR_CARRIERS * SECONDARY_WEIGHT
-        # else:
-        #     score += len(carriers_present_in_both) / len(all_carriers) * SECONDARY_WEIGHT
-        print(score)
+B = classification_df_dummies.astype(float).values  # rows: technologies, cols: factors
 
-        correlation_matrix.loc[tech_i, tech_j] = score
+# cosine similarity (row-normalized dot product)
+norms = np.linalg.norm(B, axis=1, keepdims=True)
+B_norm = np.divide(B, norms, where=norms != 0)
 
-# =============================================================================
-# OPTIONAL: ADD MINIMUM BACKGROUND CORRELATION
-# =============================================================================
-correlation_matrix = (
-    MIN_CORRELATION
-    + (1 - MIN_CORRELATION) * correlation_matrix
+corr_mat = B_norm @ B_norm.T
+
+# enforce symmetry + exact diagonal = 1
+np.fill_diagonal(corr_mat, 1.0)
+# lam = 1e-6
+# corr_mat_pd = (1 - lam) * corr_mat + lam * np.eye(corr_mat.shape[0])
+
+correlation_matrix = pd.DataFrame(
+    corr_mat,
+    index=classification_df_dummies.index,
+    columns=classification_df_dummies.index
 )
-
-# Restore diagonal to exactly 1
-np.fill_diagonal(correlation_matrix.values, 1.0)
-
 # =============================================================================
 # RESULT
 # =============================================================================
