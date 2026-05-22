@@ -9,8 +9,14 @@ from zen_garden import run
 from datetime import datetime
 from preprocessing.helpers import check_for_semidefinite
 
+on_server = True
+if on_server:
+    root_path = Path("/home/jwiegner/ZEN-models")
+else:    
+    root_path = Path("C:/ZenGardenInput/ZEN-models")
+
 # Check for positive semi-definite matrix in input
-tech_capex_path = Path("C:/ZenGardenInput/ZEN-models/data/Crystal_Ball/mean_variance/technology_capex")
+tech_capex_path = root_path / Path("data/Crystal_Ball/mean_variance/technology_capex")
 correlation = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
 check_for_semidefinite(correlation)
 
@@ -19,10 +25,10 @@ example_dataset = False
 weights = [10e6, 10e3, 1, 10e-3, 10e-6]
 # weights = [10e6]
 if example_dataset:
-    os.chdir("C:/ZenGardenInput/example_datasets")
+    os.chdir(root_path / "data/example_datasets")
     dataset = "8_yearly_variation"
 else:
-    os.chdir("C:/ZenGardenInput/ZEN-models/data")
+    os.chdir(root_path / "data")
     dataset = "Crystal_Ball"
 
 now = datetime.now()
