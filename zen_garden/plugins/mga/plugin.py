@@ -36,10 +36,19 @@ Configuration (via the "plugins.mga" block in config.json):
     oracle (dict): used only in oracle mode. Keys:
         max_iterations (int), tolerance (float, REQUIRED — no default),
         Md_override (float), t_max_override (float|None).
+        normalization (str): "none" (default, raw z) | "fmax" (each z_i
+            normalised by U_i* = max z_i over the near-optimal polytope;
+            U_i* is solved once per tech and cached on disk).
+        include_cost (bool): default False. When True the exploration
+            vector is augmented with a total-cost coordinate (the model's
+            net_present_cost), normalised to (C - C*) / (eps * C*).
+            Recommended together with normalization="fmax".
         Solver is hardcoded to Gurobi.
 """
 
+import json
 import logging
+import time
 import warnings
 from pathlib import Path
 
@@ -78,7 +87,8 @@ class MGA:
     scalar t, and three constraints are added by `setup_projection_model()`.
     """
 
-    def __init__(self, optimization_setup, epsilon, postprocess_ctx, exclude_techs=None):
+    def __init__(self, optimization_setup, epsilon, postprocess_ctx, exclude_techs=None,
+                 normalization="none", include_cost=False):
         """
         Args:
             optimization_setup: The OptimizationSetup instance, expected to
@@ -91,6 +101,10 @@ class MGA:
             exclude_techs: Optional list of technology names to drop from the
                 exploration vector z. Used in random_directions and oracle
                 modes; ignored in weights mode.
+            normalization: "none" (raw z) or "fmax" (z_i / U_i*). oracle mode
+                only; ignored elsewhere.
+            include_cost: if True, augment z with a total-cost coordinate.
+                oracle mode only; ignored elsewhere.
         """
         self.optimization_setup = optimization_setup
         self.model = optimization_setup.model
@@ -101,6 +115,18 @@ class MGA:
         # C* captured here, before any MGA modifications to model.objective.
         self.c_star = self.model.objective.value
         self.postprocess_ctx = postprocess_ctx
+
+        # Exploration-coordinate options (oracle mode). Defaults reproduce the
+        # historical raw-z, design-only behaviour byte-for-byte.
+        self.normalization = normalization
+        self.include_cost = include_cost
+        # fmax state, populated by compute_fmax_normalization() when used:
+        #   u_star   - per-tech U_i* on z_techs order
+        #   _u_tilde - augmented scale (u_star, [eps*C*]) on explore order
+        #   _offset  - augmented offset (0..., [C*]) on explore order
+        self.u_star = None
+        self._u_tilde = None
+        self._offset = None
 
         # Build the canonical exploration-tech list (z_techs) from the full
         # set_technologies coord, with optional exclusions. This is the
@@ -115,6 +141,16 @@ class MGA:
             )
         self.z_techs = [t for t in all_techs if t not in excluded]
         self.n_z = len(self.z_techs)
+
+        # Baseline design vector z*, captured NOW while capacity_addition.solution
+        # still holds the baseline solve. The fmax LPs (compute_fmax_normalization)
+        # overwrite that solution, so z* must be frozen before they run.
+        self._z_star_design_raw = (
+            self.cap_add.solution
+            .sel(set_technologies=self.z_techs)
+            .sum(["set_capacity_types", "set_location", "set_time_steps_yearly"])
+            .values
+        )
 
         # Iteration counter for labelling Postprocess folders in the new modes.
         self._iter_count = 0
@@ -171,18 +207,173 @@ class MGA:
     # Common helpers used by random_directions and oracle modes
     # ------------------------------------------------------------------
 
-    def _extract_z(self) -> np.ndarray:
-        """Read z = S*x from the most recent solve.
+    @property
+    def n_explore(self) -> int:
+        """Dimension of the exploration vector handed to ORACLE (n_z, or n_z+1
+        when include_cost augments z with a cost coordinate)."""
+        return self.n_z + (1 if self.include_cost else 0)
 
-        Returns a 1D ndarray of length n_z in the canonical self.z_techs order.
-        xarray's .sel(coord=[list]) preserves the order of the list, so a
-        single vectorised sel + sum is equivalent to a per-tech loop but cheaper.
+    def _to_explore_coords(self, z_design_raw: np.ndarray, c_raw=None) -> np.ndarray:
+        """Map a raw (design, cost) solution to ORACLE polytope coordinates.
+
+        - include_cost appends the raw total cost as the last coordinate.
+        - normalization=="fmax" applies the affine map (z - offset) / U_tilde,
+          so design axes become z_i/U_i* and the cost axis becomes
+          (C - C*)/(eps*C*).
+        With normalization=="none" and include_cost=False this is the identity
+        (raw design z) — byte-identical to the historical behaviour.
         """
-        return (
+        raw = np.asarray(z_design_raw, dtype=float)
+        if self.include_cost:
+            raw = np.append(raw, float(c_raw))
+        if self.normalization == "fmax":
+            return (raw - self._offset) / self._u_tilde
+        return raw
+
+    def _extract_z(self) -> np.ndarray:
+        """Read the exploration vector z from the most recent solve.
+
+        Returns a 1D ndarray of length n_explore in the canonical z_techs
+        order (cost appended last when include_cost). xarray's .sel(coord=
+        [list]) preserves list order, so a single vectorised sel + sum is
+        equivalent to a per-tech loop but cheaper. Coordinates are normalised
+        per self.normalization (see _to_explore_coords).
+        """
+        z_design_raw = (
             self.cap_add.solution
             .sel(set_technologies=self.z_techs)
             .sum(["set_capacity_types", "set_location", "set_time_steps_yearly"])
             .values
+        )
+        c_raw = None
+        if self.include_cost:
+            c_raw = float(self.model.variables["net_present_cost"].solution.sum())
+        return self._to_explore_coords(z_design_raw, c_raw)
+
+    @property
+    def z_star_explore(self) -> np.ndarray:
+        """Baseline point z* in ORACLE polytope coordinates.
+
+        Uses the baseline design vector frozen in __init__ (the fmax LPs
+        overwrite capacity_addition.solution). The baseline cost is exactly
+        C*, so with normalization=="fmax" the cost coordinate is exactly 0.
+        """
+        return self._to_explore_coords(self._z_star_design_raw, self.c_star)
+
+    def compute_fmax_normalization(self) -> None:
+        """Compute U_i* = max z_i over the near-optimal polytope, per z-tech.
+
+        Solves one LP per tech: same model state as the baseline, plus the
+        near-optimality cost cap (already added by setup()), with the
+        objective replaced by max z_i. U_i* serves dually as (a) the tightest
+        valid per-axis upper bound for the initial outer approximation
+        (Tier 3) and (b) the normalisation denominator z_i / U_i*.
+
+        Results are cached on disk as a flat JSON dict keyed by dataset name
+        and epsilon; only techs absent from the cache are recomputed. Sets
+        self.u_star, self._u_tilde, self._offset. Call once, after setup()
+        and before setup_projection_model().
+        """
+        dataset_name = Path(self.optimization_setup.analysis.dataset).name
+        # Cache lives next to the run output folders, as a sibling of
+        # folder_output (e.g. outputs/oracle_cache/). Deriving it from
+        # folder_output keeps it (a) shared across every run writing into the
+        # same outputs/ directory and (b) portable across machines — no
+        # hardcoded absolute path.
+        cache_dir = (
+            Path(self.optimization_setup.analysis.folder_output).parent
+            / "oracle_cache"
+            / dataset_name
+        )
+        cache_file = cache_dir / f"fmax_eps{self.epsilon}.json"
+
+        cached: dict = {}
+        if cache_file.exists():
+            with open(cache_file) as f:
+                cached = json.load(f)
+            logging.info(
+                f"MGA oracle fmax: loaded cache {cache_file} ({len(cached)} techs)."
+            )
+        else:
+            logging.info(f"MGA oracle fmax: no cache at {cache_file}; computing fresh.")
+
+        from_cache = [t for t in self.z_techs if t in cached]
+        missing = [t for t in self.z_techs if t not in cached]
+        if from_cache:
+            logging.info(
+                f"MGA oracle fmax: {len(from_cache)}/{self.n_z} techs from cache: "
+                f"{from_cache}"
+            )
+        if missing:
+            logging.info(
+                f"MGA oracle fmax: computing {len(missing)}/{self.n_z} techs by LP: "
+                f"{missing}"
+            )
+
+        agg_dims = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+        for tech in missing:
+            obj = self.cap_add.sel(set_technologies=tech).sum(agg_dims)
+            self.model.add_objective(obj, sense="max", overwrite=True)
+            t0 = time.time()
+            self.optimization_setup.solve()
+            elapsed = time.time() - t0
+            if not self.optimization_setup.optimality:
+                tc = self.model.termination_condition
+                raise RuntimeError(
+                    f"MGA oracle fmax: LP for tech {tech!r} did not solve to "
+                    f"optimality (termination = {tc!r}). An 'unbounded' status "
+                    f"means this tech has no finite near-optimal maximum "
+                    f"(zero/near-zero cost coefficient and no capacity limit) — "
+                    f"add it to exclude_techs."
+                )
+            u_i = float(self.cap_add.sel(set_technologies=tech).solution.sum())
+            cached[tech] = u_i
+            logging.info(
+                f"MGA oracle fmax: U*[{tech}] = {u_i:.6g} (LP took {elapsed:.1f} s)."
+            )
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, "w") as f:
+            json.dump(cached, f, indent=2, sort_keys=True)
+        logging.info(f"MGA oracle fmax: cache written to {cache_file}.")
+
+        self.u_star = np.array([cached[t] for t in self.z_techs], dtype=float)
+
+        # Sanity A7: every U_i* must be >= the baseline z_i* (it is by
+        # construction the max over a polytope that contains z*).
+        z_star = self._z_star_design_raw
+        tol = 1e-6 * (np.abs(self.u_star) + 1.0)
+        bad = self.u_star < z_star - tol
+        if bad.any():
+            i = int(np.argmax(z_star - self.u_star))
+            raise RuntimeError(
+                f"MGA oracle fmax: U*[{self.z_techs[i]}] = {self.u_star[i]:.6g} < "
+                f"baseline z*[{self.z_techs[i]}] = {z_star[i]:.6g}. The fmax LP "
+                f"is inconsistent with the baseline solve."
+            )
+        # A zero/negative U_i* cannot serve as a normalisation denominator.
+        if (self.u_star <= 0).any():
+            i = int(np.argmin(self.u_star))
+            raise RuntimeError(
+                f"MGA oracle fmax: U*[{self.z_techs[i]}] = {self.u_star[i]:.6g} "
+                f"<= 0 — cannot normalise. Add this tech to exclude_techs."
+            )
+
+        # Augmented scale/offset: design axes use U_i* with offset 0; the cost
+        # axis (when include_cost) uses the slack range eps*C* with offset C*.
+        u = list(self.u_star)
+        off = [0.0] * self.n_z
+        if self.include_cost:
+            u.append(self.epsilon * self.c_star)
+            off.append(self.c_star)
+        self._u_tilde = np.array(u, dtype=float)
+        self._offset = np.array(off, dtype=float)
+        logging.info(
+            f"MGA oracle fmax: ready. U* range [{self.u_star.min():.4g}, "
+            f"{self.u_star.max():.4g}] (raw z units); "
+            f"cost axis scale eps*C* = {self.epsilon * self.c_star:.6g}"
+            + (" (active)" if self.include_cost else " (unused, include_cost=False)")
+            + "."
         )
 
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
@@ -214,10 +405,20 @@ class MGA:
              capex parameter (e.g. PWA-only conversion, transport with only
              distance-cost) contribute tilde_c_i = 0, which is also valid.
 
+          4. Tier 3 (normalization=="fmax" only): n_z rows  z_i <= U_i*  from
+             the fmax LPs. Provably valid AND tightest; added alongside
+             Tier 1/2 (the polytope intersection keeps the tighter row).
+          5. Cost rows (include_cost only): C <= (1+eps)*C* and -C <= -C*.
+
+        When normalization=="fmax" the assembled raw polytope is finally
+        mapped to normalised coordinates: A0 <- A0 @ diag(U_tilde),
+        b0 <- b0 - A0_raw @ offset (see _to_explore_coords).
+
         Containment of z* is asserted before returning; a violation raises.
 
         Returns:
-            (A0, b0): np.ndarray of shape (n_rows, n_z) and (n_rows,).
+            (A0, b0): np.ndarray of shape (n_rows, n_explore) and (n_rows,),
+            in ORACLE polytope coordinates.
         """
         es = self.optimization_setup.energy_system
         params = self.optimization_setup.parameters
@@ -392,9 +593,39 @@ class MGA:
 
         A0 = np.vstack(rows)
         b0 = np.concatenate(b_parts)
+        n_raw_design_rows = A0.shape[0]  # non-negativity + Tier 1 + Tier 2
 
-        # --- Sanity assert: A0 @ z* <= b0 (with tolerance) ---
-        z_star = self._extract_z()
+        # --- Tier 3: per-tech fmax upper bounds  z_i <= U_i*  (fmax only) ---
+        # Provably valid (U_i* is by construction the max of z_i over the
+        # near-optimal polytope) and provably tightest. Added ALONGSIDE
+        # Tier 1/2, not instead of them: the polytope intersection keeps the
+        # tightest row per axis, so the change is additive and reversible.
+        n_tier3 = 0
+        if self.normalization == "fmax":
+            A0 = np.vstack([A0, np.eye(n_z)])
+            b0 = np.concatenate([b0, self.u_star])
+            n_tier3 = n_z
+
+        # --- Cost coordinate: 2 rows  C <= (1+eps)C*  and  -C <= -C*  ---
+        if self.include_cost:
+            # widen every existing row with a zero cost column
+            A0 = np.hstack([A0, np.zeros((A0.shape[0], 1))])
+            cost_up = np.zeros((1, n_z + 1)); cost_up[0, n_z] = 1.0
+            cost_lo = np.zeros((1, n_z + 1)); cost_lo[0, n_z] = -1.0
+            A0 = np.vstack([A0, cost_up, cost_lo])
+            b0 = np.concatenate(
+                [b0, [(1.0 + self.epsilon) * self.c_star], [-self.c_star]]
+            )
+
+        # --- Normalisation transform (fmax only) ---
+        # Each raw row  a^T z_raw <= b  with z_raw = offset + diag(U_tilde) z_norm
+        # becomes  (a o U_tilde)^T z_norm <= b - a^T offset.
+        if self.normalization == "fmax":
+            b0 = b0 - A0 @ self._offset       # uses raw A0 — must precede scaling
+            A0 = A0 @ np.diag(self._u_tilde)
+
+        # --- Sanity assert: A0 @ z*_explore <= b0  (containment, A5/B8) ---
+        z_star = self.z_star_explore
         lhs = A0 @ z_star
         abs_tol = 1e-6 * (np.abs(b0) + 1.0)
         violations = lhs > b0 + abs_tol
@@ -403,23 +634,37 @@ class MGA:
             raise RuntimeError(
                 f"MGA initial outer approximation violates containment of z*: "
                 f"row {i}: lhs={lhs[i]:.6g} > rhs={b0[i]:.6g} "
-                f"(slack {lhs[i] - b0[i]:.3g}). Tier 1 row count={len(tier1_rows)}; "
-                f"if i < n_z this is a non-negativity row (z*_i < 0 — should be impossible); "
-                f"if n_z <= i < n_z + tier1_count this is a Tier 1 row; "
-                f"otherwise it is the Tier 2 cost-cap row."
+                f"(slack {lhs[i] - b0[i]:.3g}). Row blocks: [0,{n_z}) "
+                f"non-negativity, [{n_z},{n_raw_design_rows}) Tier 1/2, "
+                f"[{n_raw_design_rows},{n_raw_design_rows + n_tier3}) Tier 3 fmax, "
+                f"remaining rows cost upper/lower."
             )
 
         # --- Diagnostic logging ---
-        ratio = float(tilde_c @ z_star / self.c_star) if self.c_star else 0.0
+        ratio = (
+            float(tilde_c @ self._z_star_design_raw / self.c_star)
+            if self.c_star else 0.0
+        )
+        n_cost_rows = 2 if self.include_cost else 0
         logging.info(
-            f"MGA outer approximation: n_z={n_z}, Tier 1 rows={len(tier1_rows)} "
-            f"(capacity_addition_max: {n_tier1_cam}, capacity_limit: {n_tier1_clim}), "
-            f"Tier 2 rows=1. tilde_c @ z* / C* = {ratio:.4g} "
-            f"(should be in (0, 1] for a well-formed under-approximation; "
-            f"techs with non-zero tilde_c: {int((tilde_c > 0).sum())}/{n_z}; "
+            f"MGA outer approximation [normalization={self.normalization}, "
+            f"include_cost={self.include_cost}]: n_explore={A0.shape[1]} "
+            f"(n_z={n_z}{' + 1 cost' if self.include_cost else ''}), "
+            f"rows={A0.shape[0]} = {n_z} non-neg + {len(tier1_rows)} Tier 1 "
+            f"(cap_add_max {n_tier1_cam}, cap_limit {n_tier1_clim}) + 1 Tier 2 "
+            f"+ {n_tier3} Tier 3 fmax + {n_cost_rows} cost. "
+            f"tilde_c @ z*_raw / C* = {ratio:.4g} (raw units; should be in "
+            f"(0,1]; techs with non-zero tilde_c: {int((tilde_c > 0).sum())}/{n_z}; "
             f"PWA-conversion techs with tilde_c=0: {n_pwa}; "
             f"techs not classifiable as conv/stor/tran: {n_no_capex})."
         )
+        if self.normalization == "fmax":
+            logging.info(
+                "MGA outer approximation: coordinates NORMALISED — A0/b0, the "
+                "projection LP and the L-inf convergence metric all operate in "
+                "z/U* space (design axes dimensionless, near-optimal range "
+                "[0,1]); cost axis = (C-C*)/(eps*C*), near-optimal range [0,1]."
+            )
         return A0, b0
 
     def _solve_and_postprocess(self, label: str) -> None:
@@ -488,17 +733,25 @@ class MGA:
     def setup_projection_model(self) -> None:
         """Add the L-infinity projection model to the linopy model.
 
-        New variables (both on dim "set_technologies" with the FILTERED
-        z_techs coord; this re-uses the dim name so that linopy aligns
-        Sx and delta naturally via xarray):
-            mga_oracle_delta: vector, free.
-            mga_oracle_t:     scalar, lower=0.
+        New variables:
+            mga_oracle_delta:      vector on set_technologies (z_techs), free.
+            mga_oracle_t:          scalar (trivial dim), lower=0.
+            mga_oracle_delta_cost: scalar (trivial dim), free — include_cost only.
 
         New constraints (paper's z_f variable is eliminated by substitution:
         Sx = z_f and z_O - z_f = delta combine into Sx - delta == z_O):
-            mga_oracle_proj_eq: Sx - delta == trial    (RHS updated per iter)
-            mga_oracle_t_pos:   delta - t*1 <= 0
-            mga_oracle_t_neg: -delta - t*1 <= 0
+            mga_oracle_proj_eq:  Sx - delta == trial   (RHS updated per iter)
+            mga_oracle_t_pos:    d_scale o delta - t*1 <= 0
+            mga_oracle_t_neg:  -(d_scale o delta) - t*1 <= 0
+        With normalization=="fmax", d_scale_i = 1/U_i*, so min t gives the
+        NORMALISED L-inf distance directly; with "none", d_scale = 1 and the
+        constraints reduce to the historical raw form.
+
+        include_cost adds a parallel cost track sharing the same t:
+            mga_oracle_proj_eq_cost: C(x) - delta_cost == trial_C
+            mga_oracle_t_pos_cost:   c_scale*delta_cost - t*1 <= 0
+            mga_oracle_t_neg_cost: -(c_scale*delta_cost) - t*1 <= 0
+        with c_scale = 1/(eps*C*) (fmax) or 1 (none).
 
         Call exactly once before the ORACLE loop.
         """
@@ -539,33 +792,115 @@ class MGA:
         )
 
         self.model.add_constraints(Sx - self.delta == zero_trial, name="mga_oracle_proj_eq")
-        self.model.add_constraints(self.delta - self.t_var <= 0, name="mga_oracle_t_pos")
-        self.model.add_constraints(-self.delta - self.t_var <= 0, name="mga_oracle_t_neg")
-        logging.info(f"MGA oracle: projection model added (n_z = {self.n_z})")
+
+        # Per-axis L-inf scaling. With normalization=="fmax", d_scale_i = 1/U_i*
+        # so  min t  yields t* = max_i |delta_i|/U_i* = the NORMALISED L-inf
+        # distance. With "none", d_scale = 1 and the constraints reduce to the
+        # historical raw form.
+        if self.normalization == "fmax":
+            d_scale_vals = 1.0 / self.u_star
+        else:
+            d_scale_vals = np.ones(self.n_z)
+        d_scale = xr.DataArray(
+            d_scale_vals,
+            dims="set_technologies",
+            coords={"set_technologies": self.z_techs},
+        )
+        self.model.add_constraints(
+            d_scale * self.delta - self.t_var <= 0, name="mga_oracle_t_pos"
+        )
+        self.model.add_constraints(
+            -(d_scale * self.delta) - self.t_var <= 0, name="mga_oracle_t_neg"
+        )
+
+        # --- Cost-coordinate projection track (include_cost only) ---
+        # delta_cost absorbs C(x) - trial_C; the SHARED t_var makes t* the
+        # L-inf distance over all n_z+1 normalised axes at once.
+        if self.include_cost:
+            self.delta_cost = self.model.add_variables(
+                coords=[t_coord], name="mga_oracle_delta_cost",
+                lower=-np.inf, upper=np.inf,
+            )
+            cost_expr = self.optimization_setup.energy_system.rules.objective_total_cost(
+                self.model
+            )
+            zero_cost = xr.DataArray(
+                np.zeros(1),
+                dims="mga_oracle_scalar_dim",
+                coords={"mga_oracle_scalar_dim": [0]},
+            )
+            self.model.add_constraints(
+                cost_expr - self.delta_cost == zero_cost,
+                name="mga_oracle_proj_eq_cost",
+            )
+            c_scale = 1.0 / (self.epsilon * self.c_star) if self.normalization == "fmax" else 1.0
+            self.model.add_constraints(
+                c_scale * self.delta_cost - self.t_var <= 0,
+                name="mga_oracle_t_pos_cost",
+            )
+            self.model.add_constraints(
+                -(c_scale * self.delta_cost) - self.t_var <= 0,
+                name="mga_oracle_t_neg_cost",
+            )
+
+        logging.info(
+            f"MGA oracle: projection model added (n_z = {self.n_z}, "
+            f"normalization = {self.normalization!r}, "
+            f"include_cost = {self.include_cost})"
+        )
 
     def find_nearest_point(self, trial_point: np.ndarray):
         """Callback for pyoNearOpt ORACLE.
 
-        Returns (z_feas, dist, mu_cut, b_cut, flag) where mu_cut is L2-normalised
-        and b_cut = mu_cut @ z_feas, matching the decagon reference convention.
+        trial_point arrives in ORACLE polytope coordinates: normalised when
+        normalization=="fmax", augmented with a cost coordinate (last entry)
+        when include_cost. Returns (z_feas, dist, mu_cut, b_cut, flag) in the
+        SAME coordinates; mu_cut is L2-normalised and b_cut = mu_cut @ z_feas.
+
+        Coordinate algebra (normalization=="fmax"):
+            trial_raw = offset + trial_norm * U_tilde         (proj-eq RHS)
+            dist      = t*  — the projection LP minimises the NORMALISED
+                        L-inf distance directly (scaled t-constraints), so no
+                        post-hoc recomputation is needed or correct.
+            mu_norm   = mu_raw o U_tilde   (mu_raw = dual of the raw proj eq)
+            b_cut     = mu_norm @ z_feas_norm
+        The affine cost offset C* cancels in the cut, so only U_tilde scales mu.
         """
-        if trial_point.shape != (self.n_z,):
+        if trial_point.shape != (self.n_explore,):
             raise ValueError(
-                f"find_nearest_point: expected shape ({self.n_z},), got {trial_point.shape}"
+                f"find_nearest_point: expected shape ({self.n_explore},), "
+                f"got {trial_point.shape}"
             )
 
-        # Update only the RHS of the projection equality (in-place; cheap).
+        # --- Design axes: trial point -> raw coordinates, set proj-eq RHS ---
+        trial_design = trial_point[:self.n_z]
+        if self.normalization == "fmax":
+            trial_design_raw = trial_design * self.u_star
+        else:
+            trial_design_raw = trial_design
         trial_da = xr.DataArray(
-            trial_point,
+            trial_design_raw,
             dims="set_technologies",
             coords={"set_technologies": self.z_techs},
         )
         self.model.constraints["mga_oracle_proj_eq"].rhs = trial_da
 
-        # Objective: min t. The 1 * t_var coerces the scalar Variable to a
-        # LinearExpression, which is what add_objective expects.
-        # Sum collapses the trivial mga_oracle_scalar_dim back to a scalar
-        # expression for the objective.
+        # --- Cost axis: trial point -> raw cost, set cost proj-eq RHS ---
+        if self.include_cost:
+            trial_c = float(trial_point[self.n_z])
+            if self.normalization == "fmax":
+                trial_c_raw = self.c_star + trial_c * self.epsilon * self.c_star
+            else:
+                trial_c_raw = trial_c
+            trial_c_da = xr.DataArray(
+                np.array([trial_c_raw]),
+                dims="mga_oracle_scalar_dim",
+                coords={"mga_oracle_scalar_dim": [0]},
+            )
+            self.model.constraints["mga_oracle_proj_eq_cost"].rhs = trial_c_da
+
+        # Objective: min t. Sum collapses the trivial mga_oracle_scalar_dim
+        # back to a scalar expression for the objective.
         self.model.add_objective(self.t_var.sum(), sense="min", overwrite=True)
 
         label = f"oracle_iter_{self._iter_count}"
@@ -575,30 +910,46 @@ class MGA:
         )
         self._solve_and_postprocess(label)
 
+        # z_feas in polytope coordinates (already normalised/augmented).
         z_feas = self._extract_z()
 
-        # solution has shape (1,) on mga_oracle_scalar_dim; extract the scalar.
+        # dist = t* = the (normalised) L-inf projection distance.
         dist = float(self.t_var.solution.values[0])
 
-        # Dual on the projection equality. Same sign convention as scipy
-        # linprog's eqlin.marginals (confirmed via notes/dual_sign_toy.py).
-        mu_da = (
+        # --- Cutting hyperplane: dual of the projection equality, rescaled ---
+        # mu_raw = dual of the raw proj eq (sign convention matches scipy
+        # linprog eqlin.marginals). mu_norm = mu_raw o U_tilde.
+        mu_design_raw = (
             self.model.constraints["mga_oracle_proj_eq"].dual
             .sel(set_technologies=self.z_techs)
             .values
         )
-        # L2-normalise mu_cut (mirrors the decagon reference).
-        scale = np.linalg.norm(mu_da, ord=2)
+        if self.normalization == "fmax":
+            mu_cut = mu_design_raw * self.u_star
+        else:
+            mu_cut = np.asarray(mu_design_raw, dtype=float)
+
+        if self.include_cost:
+            mu_c_raw = float(
+                self.model.constraints["mga_oracle_proj_eq_cost"].dual.values[0]
+            )
+            mu_c = mu_c_raw * self.epsilon * self.c_star if self.normalization == "fmax" else mu_c_raw
+            mu_cut = np.append(mu_cut, mu_c)
+
+        # L2-normalise the (already coordinate-scaled) cut normal, then take
+        # b_cut from the SAME normalised mu_cut so the pair stays consistent.
+        scale = np.linalg.norm(mu_cut, ord=2)
         if scale > 1e-4:
-            mu_da = mu_da / scale
-        b_cut = float(mu_da @ z_feas)
+            mu_cut = mu_cut / scale
+        b_cut = float(mu_cut @ z_feas)
 
         logging.info(
-            f"MGA oracle iter {self._iter_count}: dist = {dist:.4g}, "
-            f"|mu|_max = {np.max(np.abs(mu_da)):.4g}, b_cut = {b_cut:.4g}"
+            f"MGA oracle iter {self._iter_count}: dist = {dist:.4g} "
+            f"({'normalised' if self.normalization == 'fmax' else 'raw'} L-inf), "
+            f"|mu|_max = {np.max(np.abs(mu_cut)):.4g}, b_cut = {b_cut:.4g}"
         )
         self._iter_count += 1
-        return z_feas, dist, mu_da, b_cut, 0
+        return z_feas, dist, mu_cut, b_cut, 0
 
 
 # ----------------------------------------------------------------------
@@ -611,6 +962,18 @@ def run_mga(*args, **kwargs):
     mode = config.get("mode", "weights")
     epsilon = config["epsilon"]
     exclude_techs = config.get("exclude_techs", [])
+
+    # Oracle exploration-coordinate options. Read here so MGA is built
+    # uniformly across modes; non-oracle modes leave the oracle block empty,
+    # so they get normalization="none"/include_cost=False and are unaffected.
+    ora_cfg = config.get("oracle", {})
+    normalization = ora_cfg.get("normalization", "none")
+    include_cost = bool(ora_cfg.get("include_cost", False))
+    if normalization not in ("none", "fmax"):
+        raise ValueError(
+            f"MGA: oracle.normalization must be 'none' or 'fmax', "
+            f"got {normalization!r}"
+        )
 
     optimization_setup = kwargs["optimization_setup"]
     postprocess_ctx = {
@@ -625,7 +988,11 @@ def run_mga(*args, **kwargs):
         f"n_exclude = {len(exclude_techs)}"
     )
 
-    mga = MGA(optimization_setup, epsilon, postprocess_ctx, exclude_techs=exclude_techs)
+    mga = MGA(
+        optimization_setup, epsilon, postprocess_ctx,
+        exclude_techs=exclude_techs,
+        normalization=normalization, include_cost=include_cost,
+    )
     mga.setup()
 
     if mode == "weights":
@@ -693,13 +1060,26 @@ def run_mga(*args, **kwargs):
         from pyoNearOpt.polytope_approximation.approximation_class import approximation
         import pyomo.environ as pyo
 
-        ora_cfg = config.get("oracle", {})
         max_iter = ora_cfg.get("max_iterations", 200)
         if "tolerance" not in ora_cfg:
             raise ValueError("MGA oracle: 'tolerance' is required.")
         tol = float(ora_cfg["tolerance"])
         Md_override = ora_cfg.get("Md_override", 1e8)
         t_max_override = ora_cfg.get("t_max_override", None)
+
+        if mga.include_cost and mga.normalization != "fmax":
+            logging.warning(
+                "MGA oracle: include_cost=True with normalization=%r — the cost "
+                "coordinate (~1e6 MEUR raw) is orders of magnitude larger than "
+                "the design coordinates, so the L-inf metric will collapse onto "
+                "the cost axis. Strongly recommended: set "
+                "oracle.normalization='fmax'.", mga.normalization
+            )
+
+        # fmax: solve the n_z auxiliary U_i* LPs (cached on disk) BEFORE the
+        # projection model is added and before the ORACLE loop starts.
+        if mga.normalization == "fmax":
+            mga.compute_fmax_normalization()
 
         # Add projection model to the linopy problem (ONCE).
         mga.setup_projection_model()
@@ -710,13 +1090,16 @@ def run_mga(*args, **kwargs):
                 message=".*Coordinates across variables not equal.*",
                 category=UserWarning,
             )
-            z_star = mga._extract_z()
             A0, b0 = mga.build_initial_outer_approximation()
+            z_star = mga.z_star_explore
             logging.info(f"MGA oracle: tol = {tol:.3g}")
 
+            name_list = list(mga.z_techs) + (
+                ["net_present_cost"] if mga.include_cost else []
+            )
             poly = approximation(
                 A=A0, X=z_star.reshape(1, -1), b=b0,
-                name_list=list(mga.z_techs),
+                name_list=name_list,
                 use_bigM=False,
             )
             # Big-M defaults are tuned for normalised toys; loosen for Crystal Ball.
