@@ -1,6 +1,7 @@
 {
   "solver": {
     "keep_files": false,
-    "save_duals": true
+    "save_duals": true,
+    "save_reduced_costs": true
   }
 }

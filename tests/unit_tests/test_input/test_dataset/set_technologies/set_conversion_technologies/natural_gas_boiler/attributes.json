@@ -83,5 +83,9 @@
   "variance_capex_specific_conversion": {
     "default_value": 0.05,
     "unit": "1"
+  },
+  "variance_opex_specific_variable": {
+    "default_value": 0.05,
+    "unit": "1"
   }
 }
