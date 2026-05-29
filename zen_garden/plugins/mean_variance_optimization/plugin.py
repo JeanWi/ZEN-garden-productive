@@ -8,10 +8,6 @@ import logging
 from tqdm import tqdm
 
 from zen_garden.plugin_system.events import Event, EventPublisher
-from zen_garden.model.element import GenericRule, Element
-from zen_garden.model.component import IndexSet
-from zen_garden.preprocess.extract_input_data import DataInput
-from zen_garden.preprocess.unit_handling import UnitHandling
 
 
 config = {
@@ -286,23 +282,27 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     technologies = list(optimization_setup.sets["set_technologies"])
     set_capacity_types = ["power", "energy"]
 
-    capacity_addition_tech_agg = model.add_variables(
-        lower=0,
-        coords=[
-            pd.Index(technologies, name="set_technologies"),
-            pd.Index(set_capacity_types, name="set_capacity_types"),
-        ],
-        name="capacity_addition_tech_agg",
-    )
+    if "capacity_addition_tech_agg" in model.variables:
+        capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
+    else:
+        capacity_addition_tech_agg = model.add_variables(
+            lower=0,
+            coords=[
+                pd.Index(technologies, name="set_technologies"),
+                pd.Index(set_capacity_types, name="set_capacity_types"),
+            ],
+            name="capacity_addition_tech_agg",
+        )
 
     # ------------------------------------------------------------------ #
     # 2. Constraint:  C_agg[tech, cap] == Σ_{loc,t} capacity_addition   #
     # ------------------------------------------------------------------ #
-    capacity_addition_agg_expr = capacity_addition.sum(["set_location", "set_time_steps_yearly"])
-    model.add_constraints(
-        capacity_addition_tech_agg - capacity_addition_agg_expr == 0,
-        name="constraint_capacity_addition_tech_agg",
-    )
+    if "constraint_capacity_addition_tech_agg" not in model.constraints:
+        capacity_addition_agg_expr = capacity_addition.sum(["set_location", "set_time_steps_yearly"])
+        model.add_constraints(
+            capacity_addition_tech_agg - capacity_addition_agg_expr == 0,
+            name="constraint_capacity_addition_tech_agg",
+        )
 
     # ------------------------------------------------------------------ #
     # 3. σ per (tech, cap_type): mean of absolute SD over loc / time    #
