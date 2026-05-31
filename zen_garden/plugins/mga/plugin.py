@@ -7,60 +7,63 @@ problem under one of three exploration modes selected via config:
 
     * "weights" (existing): user-provided list of per-iteration weight dicts;
       each iteration solves min sum_i w_i * cap_add_i.
-    * "random_directions" (new): uniform sampling of directions on the unit
-      hypersphere; per direction, one solve max d^T z over Z_eps. Delegates
-      the loop to pyoNearOpt.exploration_methods.random.random_directions.
-    * "oracle" (new): ORACLE algorithm from Turan, Moret, Bardow (2026).
+    * "oracle": ORACLE algorithm from Turan, Moret, Bardow (2026).
       Iteratively refines inner/outer polytope approximations of Z_eps via
       L-infinity projections of trial points. Delegates the loop to
       pyoNearOpt.exploration_methods.ORACLE.oracle.
 
-The initial outer polytope (oracle + random_directions modes) is derived
-directly from the model. Always includes Tier 1a (per-tech aggregate
-`capacity_addition_max` bounds), Tier 1b (per-tech `capacity_limit` sums),
-and one Tier 2 cost-cap half-space with `min`-under-approximated per-axis
-unit cost. With `normalization="fmax"`, n_z Tier 3 rows `z_g <= U_g*` are
-added from the fmax LPs. With `include_cost=true`, two cost-coordinate
-rows (`C <= (1+eps)*C*` and `C >= C*`) are added. Per-axis values are
-either singleton techs (default) or lumped groups (via `include_techs`).
-See `MGA.build_initial_outer_approximation`.
+    ("random_directions" was retired when the legacy capacity-based
+    outer-approximation bounds were removed — it never ran the fmax LPs and so
+    has no bound source. The branch now raises NotImplementedError.)
+
+For ORACLE, the initial outer polytope is the per-axis fmax box: one upper
+bound `z_i <= U_i*` per axis (from the fmax LPs, which also supply the
+normalisation denominators), plus per-axis non-negativity `z_i >= 0`, plus —
+when `include_cost=true` — two cost-coordinate rows (`C <= (1+eps)*C*` and
+`C >= C*`). Coordinates are ALWAYS normalised (z_i / U_i*), so the box is the
+unit cube in normalised space. The near-optimal cost budget c^T x <= (1+eps)C*
+is enforced inside the model (added by setup()), not as a polytope row. Each
+axis is either a tech-capacity axis (sum of capacity_addition over member
+techs; singleton or lumped via `include_techs`) or a carrier-import axis
+(duration-weighted annual flow_import over member carriers, via
+`include_carrier_imports`). See `MGA.build_initial_outer_approximation`.
 
 Each iteration is written to disk as a sibling sub-solution next to the
 baseline, using Postprocess with a modified model_name.
 
 Configuration (via the "plugins.mga" block in config.json):
     epsilon (float): near-optimality slack. Default 0.1.
-    mode (str): "weights" | "random_directions" | "oracle". Default "weights".
-    exclude_techs (list[str]): technologies excluded from z (the exploration
-        vector). Used in random_directions and oracle modes only; ignored in
-        weights mode (where excluded techs simply default to weight 0).
-        Mutually exclusive with include_techs.
-    include_techs (list): positive list specifying which technologies are in
-        z. Alternative to exclude_techs (mutually exclusive). Each entry is
-        either a bare string (singleton tech axis) or a single-key dict
-        {group_name: [member_tech_1, member_tech_2, ...]} (a lumped group:
-        one z-axis equal to the sum of capacity_addition over all members).
+    mode (str): "weights" | "oracle". Default "weights".
+    exclude_techs (list[str]): technologies excluded from the tech-capacity
+        axes. oracle mode only. Mutually exclusive with include_techs.
+    include_techs (list): positive list of tech-capacity axes. Alternative to
+        exclude_techs (mutually exclusive). Each entry is either a bare string
+        (singleton tech axis) or a single-key dict
+        {group_name: [member_tech_1, ...]} (a lumped axis: one z-axis equal to
+        the sum of capacity_addition over all members).
         Example:
             "include_techs": [
                 "nuclear", "photovoltaics",
                 {"ccs_lump": ["BF_BOF_CCS", "SMR_CCS",
                               "natural_gas_turbine_CCS"]}
             ]
-        Used in random_directions and oracle modes only.
+    include_carrier_imports (list): positive list of carrier-import axes,
+        additive with the tech axes. Each entry is a bare carrier string
+        (singleton axis = that carrier's duration-weighted annual import) or a
+        single-key dict {name: [carrier_1, ...]} (a lumped carrier axis). The
+        axis value is sum_{m,n,t} tau_t * flow_import[m, n, t] (GWh/yr).
+        Example: "include_carrier_imports": ["biomass"].
     iterations (list[dict]): used only in weights mode. One entry per MGA
         iteration with a "weights": {tech_name: float} dict.
-    random_directions (dict): used only in random_directions mode. Keys:
-        n_iterations (int), seed (int|None).
     oracle (dict): used only in oracle mode. Keys:
         max_iterations (int), tolerance (float, REQUIRED — no default),
         Md_override (float), t_max_override (float|None).
-        normalization (str): "none" (default, raw z) | "fmax" (each z_i
-            normalised by U_i* = max z_i over the near-optimal polytope;
-            U_i* is solved once per tech and cached on disk).
-        include_cost (bool): default False. When True the exploration
-            vector is augmented with a total-cost coordinate (the model's
+        include_cost (bool): default False. When True the exploration vector
+            is augmented with a total-cost coordinate (the model's
             net_present_cost), normalised to (C - C*) / (eps * C*).
-            Recommended together with normalization="fmax".
+        (normalization is ALWAYS on for ORACLE — every axis is normalised by
+        its fmax maximum U_i*. A legacy "normalization" key is ignored with a
+        deprecation note.)
         Solver is hardcoded to Gurobi.
 """
 
@@ -88,8 +91,8 @@ config = {
     "mode": "weights",
     "exclude_techs": [],
     "include_techs": [],
+    "include_carrier_imports": [],
     "iterations": [],
-    "random_directions": {},
     "oracle": {},
 }
 
@@ -108,7 +111,7 @@ class MGA:
     """
 
     def __init__(self, optimization_setup, epsilon, postprocess_ctx, exclude_techs=None,
-                 include_techs=None, normalization="none", include_cost=False):
+                 include_techs=None, include_carrier_imports=None, include_cost=False):
         """
         Args:
             optimization_setup: The OptimizationSetup instance, expected to
@@ -119,17 +122,24 @@ class MGA:
                 "model_name", "scenario_name", "param_map". Forwarded to
                 Postprocess for each iteration's output.
             exclude_techs: Optional list of technology names to drop from the
-                exploration vector z. Used in random_directions and oracle
-                modes; ignored in weights mode. Mutually exclusive with
+                tech-capacity exploration axes. Mutually exclusive with
                 include_techs.
-            include_techs: Optional positive list. Each entry is either a
-                bare string (singleton z-axis = that tech) or a single-key
-                dict ``{name: [members]}`` (lumped z-axis = sum over members).
-                Mutually exclusive with exclude_techs.
-            normalization: "none" (raw z) or "fmax" (z_i / U_i*). oracle mode
-                only; ignored elsewhere.
+            include_techs: Optional positive list of tech-capacity axes. Each
+                entry is either a bare string (singleton axis = that tech) or a
+                single-key dict ``{name: [members]}`` (lumped axis = sum of
+                capacity_addition over members). Mutually exclusive with
+                exclude_techs.
+            include_carrier_imports: Optional list of carrier-import axes. Each
+                entry is a bare carrier string (singleton axis = that carrier's
+                duration-weighted annual import) or a single-key dict
+                ``{name: [carriers]}`` (lumped axis = sum over carriers).
+                Additive with the tech axes (does not interact with
+                include/exclude_techs).
             include_cost: if True, augment z with a total-cost coordinate.
-                oracle mode only; ignored elsewhere.
+                oracle mode only.
+
+        ORACLE mode always normalises z by the per-axis fmax maxima U_i*; there
+        is no raw-coordinate mode.
         """
         self.optimization_setup = optimization_setup
         self.model = optimization_setup.model
@@ -141,29 +151,40 @@ class MGA:
         self.c_star = self.model.objective.value
         self.postprocess_ctx = postprocess_ctx
 
-        # Exploration-coordinate options (oracle mode). Defaults reproduce the
-        # historical raw-z, design-only behaviour byte-for-byte.
-        self.normalization = normalization
         self.include_cost = include_cost
-        # fmax state, populated by compute_fmax_normalization() when used:
+        # fmax state, populated by compute_fmax_normalization():
         #   u_star   - per-axis U_g* on z_names order
         #   _u_tilde - augmented scale (u_star, [eps*C*]) on explore order
         #   _offset  - augmented offset (0..., [C*]) on explore order
+        # ORACLE always normalises; these must be set before any coordinate
+        # transform (see _to_explore_coords, which raises if they are None).
         self.u_star = None
         self._u_tilde = None
         self._offset = None
 
-        # --- Build z_groups: the canonical list of exploration AXES ---
-        # Each axis is a (name, members) tuple. Singletons (legacy behaviour)
-        # are groups of one with name == member tech. Lumped groups (new) have
-        # an axis name distinct from any tech and contribute one z-axis equal
-        # to the sum of capacity_addition over their members. This is the
-        # SINGLE source of truth for the ordering of w, z, mu, name_list
-        # everywhere downstream.
+        # --- Build the canonical list of exploration AXES ---
+        # Each axis is a (name, members) tuple carrying a KIND in self.axis_kind:
+        #   "tech_capacity"  -> members are technologies; the axis value is the
+        #                       sum of capacity_addition over members.
+        #   "carrier_import" -> members are carriers; the axis value is the
+        #                       duration-weighted annual flow_import over members.
+        # z_groups is the SINGLE source of truth for the ordering of z, mu,
+        # name_list everywhere downstream. Tech axes come first (in the order
+        # implied by include_techs/exclude_techs), then carrier axes (user order).
         all_techs = list(self.cap_add.coords["set_technologies"].values)
         all_techs_set = set(all_techs)
+        # Carriers (for carrier-import axes + the group-name reserved set).
+        if "flow_import" in self.model.variables:
+            all_carriers = list(
+                self.model.variables["flow_import"].coords["set_carriers"].values
+            )
+        else:
+            all_carriers = []
+        all_carriers_set = set(all_carriers)
+
         include_techs_list = list(include_techs or [])
         exclude_techs_list = list(exclude_techs or [])
+        include_carrier_list = list(include_carrier_imports or [])
 
         if include_techs_list and exclude_techs_list:
             raise ValueError(
@@ -260,43 +281,160 @@ class MGA:
                 )
             z_groups = [(t, [t]) for t in all_techs if t not in excluded_set]
 
+        # Tech axes are now in z_groups. Record their kind and reserve their
+        # names, then append carrier-import axes.
+        axis_kind: dict[str, str] = {name: "tech_capacity" for name, _ in z_groups}
+        seen_axis_names: set[str] = set(axis_kind)
+        # Group/lump names must be a fresh label, not an existing tech OR
+        # carrier name (the polytope name_list shares one namespace).
+        reserved_names = all_techs_set | all_carriers_set
+
+        # --- Carrier-import axes (additive; orthogonal to tech axes) ---
+        unknown_carriers: list[str] = []
+        seen_carriers: dict[str, str] = {}  # carrier -> axis that first claimed it
+        for idx, entry in enumerate(include_carrier_list):
+            if isinstance(entry, str):
+                if not entry:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}]: empty string is "
+                        f"not a valid carrier name."
+                    )
+                name = entry
+                members = [entry]
+            elif isinstance(entry, dict):
+                if len(entry) != 1:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}]: group dict must "
+                        f"have exactly one key, got {len(entry)}: "
+                        f"{sorted(entry.keys())}."
+                    )
+                (name, members) = next(iter(entry.items()))
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}]: group name must "
+                        f"be a non-empty string, got {name!r}."
+                    )
+                if name in reserved_names:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}]: group name "
+                        f"{name!r} collides with a technology or carrier name. "
+                        f"Rename the group."
+                    )
+                if not isinstance(members, list) or not members:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}] ({name!r}): group "
+                        f"members must be a non-empty list of carrier names, "
+                        f"got {members!r}."
+                    )
+                if not all(isinstance(m, str) and m for m in members):
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}] ({name!r}): every "
+                        f"member must be a non-empty string, got {members!r}."
+                    )
+            else:
+                raise ValueError(
+                    f"MGA include_carrier_imports[{idx}]: entry must be a "
+                    f"string or a single-key dict, got "
+                    f"{type(entry).__name__}: {entry!r}."
+                )
+            if name in seen_axis_names:
+                raise ValueError(
+                    f"MGA include_carrier_imports[{idx}]: axis name {name!r} "
+                    f"duplicates an existing axis (tech or carrier)."
+                )
+            seen_axis_names.add(name)
+            for m in members:
+                if m not in all_carriers_set:
+                    unknown_carriers.append(m)
+                elif m in seen_carriers:
+                    raise ValueError(
+                        f"MGA include_carrier_imports[{idx}] ({name!r}): "
+                        f"carrier {m!r} also appears in axis "
+                        f"{seen_carriers[m]!r}; each carrier may appear at "
+                        f"most once across all carrier-import axes."
+                    )
+                else:
+                    seen_carriers[m] = name
+            z_groups.append((name, list(members)))
+            axis_kind[name] = "carrier_import"
+        if unknown_carriers:
+            raise KeyError(
+                f"MGA include_carrier_imports contains unknown carriers: "
+                f"{sorted(set(unknown_carriers))}"
+            )
+
         self.z_groups: list[tuple[str, list[str]]] = z_groups
+        self.axis_kind: dict[str, str] = axis_kind
         self.z_names: list[str] = [name for name, _ in z_groups]
-        # Flat list of all member techs (for cap_add selectors / per-member
-        # loops in Tier 1/2 computation). For singleton-only configs this
-        # equals z_names — byte-identical to today's self.z_techs.
-        self.z_techs: list[str] = [m for _, members in z_groups for m in members]
+        self._members_by_name: dict[str, list[str]] = {n: m for n, m in z_groups}
+        # Flat list of all tech-axis member techs (for the projection selector
+        # matrix and the now-dead support_function). Carrier members excluded.
+        self.z_techs: list[str] = [
+            m for name, members in z_groups
+            if axis_kind[name] == "tech_capacity" for m in members
+        ]
         self.n_z: int = len(self.z_groups)
-        # True iff at least one axis is a real lump (member count > 1) or has
-        # a name not in set_technologies. Drives the proj-eq dim-name choice
-        # in setup_projection_model: False => dim "set_technologies" (legacy);
-        # True => dim "mga_z_axis" (to avoid xarray-alignment confusion with
-        # cap_add's set_technologies coord values, which contain real tech
-        # names only).
-        self._has_lumped_groups: bool = any(
+        self.has_carrier_axis: bool = any(
+            k == "carrier_import" for k in axis_kind.values()
+        )
+        # True iff the per-axis dim cannot be "set_technologies": any tech lump,
+        # any tech-axis name not in set_technologies, OR any carrier axis.
+        # Drives the proj-eq dim-name choice in setup_projection_model
+        # (set_technologies when False, else mga_z_axis).
+        self._has_lumped_groups: bool = self.has_carrier_axis or any(
             len(members) > 1 or name not in all_techs_set
             for name, members in z_groups
+            if axis_kind[name] == "tech_capacity"
         )
 
-        # Baseline design vector z*, captured NOW while capacity_addition.solution
-        # still holds the baseline solve. The fmax LPs (compute_fmax_normalization)
-        # overwrite that solution, so z* must be frozen before they run. Per-group
-        # sum (length n_z); for singleton-only configs this is the same per-tech
-        # vector as today.
-        _agg = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+        # Model handles for carrier-import axes (looked up once).
+        if self.has_carrier_axis:
+            self.flow_import = self.model.variables["flow_import"]
+            # Operational time-step duration tau_t (set_time_steps_operation).
+            self._ts_duration = (
+                self.optimization_setup.parameters.time_steps_operation_duration
+            )
+        else:
+            self.flow_import = None
+            self._ts_duration = None
+
+        # Baseline design vector z*, captured NOW while the baseline solution is
+        # still loaded (the fmax LPs overwrite it). Per-axis, kind-aware.
         self._z_star_design_raw = np.array(
-            [
-                float(
-                    self.cap_add.solution
-                    .sel(set_technologies=members)
-                    .sum(_agg + ["set_technologies"])
-                )
-                for _, members in z_groups
-            ],
-            dtype=float,
+            [self._axis_value(name) for name in self.z_names], dtype=float
         )
 
-        # Iteration counter for labelling Postprocess folders in the new modes.
+        # Sanity tripwire for carrier axes: the duration-weighted import must be
+        # positive, finite, and DIFFERENT from the unweighted sum (the 10
+        # aggregated op-steps have durations far from 1, so equality would mean
+        # tau_t was silently dropped — the most likely mistake).
+        for name in self.z_names:
+            if self.axis_kind[name] != "carrier_import":
+                continue
+            members = self._members_by_name[name]
+            weighted = self._axis_value(name)
+            unweighted = float(
+                self.flow_import.solution.sel(set_carriers=members).sum()
+            )
+            if not (np.isfinite(weighted) and weighted > 0):
+                raise RuntimeError(
+                    f"MGA carrier axis {name!r}: baseline duration-weighted "
+                    f"import is {weighted!r}; expected a positive finite value."
+                )
+            if abs(weighted - unweighted) <= 1e-6 * max(1.0, abs(weighted)):
+                raise RuntimeError(
+                    f"MGA carrier axis {name!r}: duration-weighted import "
+                    f"({weighted:.6g}) equals the unweighted sum "
+                    f"({unweighted:.6g}). The time_steps_operation_duration "
+                    f"weighting was not applied — this is a bug."
+                )
+            logging.info(
+                f"MGA carrier axis {name!r}: baseline weighted import = "
+                f"{weighted:.6g} (GWh/yr), unweighted sum = {unweighted:.6g} "
+                f"(tripwire OK; members={members})."
+            )
+
+        # Iteration counter for labelling Postprocess folders.
         self._iter_count = 0
 
     def setup(self):
@@ -357,43 +495,79 @@ class MGA:
         when include_cost augments z with a cost coordinate)."""
         return self.n_z + (1 if self.include_cost else 0)
 
+    # Aggregation dims per axis kind (module-private constants inlined here).
+    _TECH_AGG = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+    _CARRIER_AGG = ["set_carriers", "set_nodes", "set_time_steps_operation"]
+
+    def _axis_linexpr(self, name: str):
+        """linopy LinearExpression for one axis (fmax LP objective / projection).
+
+        Branches on axis kind (the ONLY place, besides _axis_value, that does):
+          tech_capacity  -> sum of capacity_addition over the axis's member
+                            techs and over (cap_type, loc, year).
+          carrier_import -> duration-weighted sum of flow_import over the axis's
+                            member carriers, nodes, and operational time steps:
+                            sum_{m,n,t} tau_t * flow_import[m, n, t].
+        """
+        members = self._members_by_name[name]
+        if self.axis_kind[name] == "tech_capacity":
+            return (
+                self.cap_add.sel(set_technologies=members)
+                .sum(self._TECH_AGG + ["set_technologies"])
+            )
+        # carrier_import
+        return (
+            (self._ts_duration * self.flow_import.sel(set_carriers=members))
+            .sum(self._CARRIER_AGG)
+        )
+
+    def _axis_value(self, name: str) -> float:
+        """Scalar value of one axis on the currently loaded solution.
+
+        Same expression as _axis_linexpr but evaluated on `.solution`; used for
+        the frozen baseline z* and for _extract_z after each projection solve.
+        """
+        members = self._members_by_name[name]
+        if self.axis_kind[name] == "tech_capacity":
+            return float(
+                self.cap_add.solution
+                .sel(set_technologies=members)
+                .sum(self._TECH_AGG + ["set_technologies"])
+            )
+        # carrier_import
+        return float(
+            (self._ts_duration * self.flow_import.solution.sel(set_carriers=members))
+            .sum(self._CARRIER_AGG)
+        )
+
     def _to_explore_coords(self, z_design_raw: np.ndarray, c_raw=None) -> np.ndarray:
         """Map a raw (design, cost) solution to ORACLE polytope coordinates.
 
-        - include_cost appends the raw total cost as the last coordinate.
-        - normalization=="fmax" applies the affine map (z - offset) / U_tilde,
-          so design axes become z_i/U_i* and the cost axis becomes
-          (C - C*)/(eps*C*).
-        With normalization=="none" and include_cost=False this is the identity
-        (raw design z) — byte-identical to the historical behaviour.
+        ORACLE always normalises: this applies the affine map
+        (z - offset) / U_tilde, so design axes become z_i/U_i* and (when
+        include_cost) the cost axis becomes (C - C*)/(eps*C*). The fmax LPs
+        must have run first (u_star/_u_tilde/_offset populated).
         """
+        if self._u_tilde is None:
+            raise RuntimeError(
+                "MGA: coordinate normalisation requested before the fmax LPs "
+                "ran; compute_fmax_normalization() must be called first."
+            )
         raw = np.asarray(z_design_raw, dtype=float)
         if self.include_cost:
             raw = np.append(raw, float(c_raw))
-        if self.normalization == "fmax":
-            return (raw - self._offset) / self._u_tilde
-        return raw
+        return (raw - self._offset) / self._u_tilde
 
     def _extract_z(self) -> np.ndarray:
         """Read the exploration vector z from the most recent solve.
 
         Returns a 1D ndarray of length n_explore in the canonical z_groups
-        order (cost appended last when include_cost). Each entry is the sum
-        of capacity_addition over the group's members and over (cap_type,
-        loc, year). For singleton-only configs this is byte-identical to the
-        previous per-tech aggregation.
+        order (cost appended last when include_cost), in normalised
+        coordinates. Each design entry is its axis value (kind-aware, see
+        _axis_value).
         """
-        _agg = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
         z_design_raw = np.array(
-            [
-                float(
-                    self.cap_add.solution
-                    .sel(set_technologies=members)
-                    .sum(_agg + ["set_technologies"])
-                )
-                for _, members in self.z_groups
-            ],
-            dtype=float,
+            [self._axis_value(name) for name in self.z_names], dtype=float
         )
         c_raw = None
         if self.include_cost:
@@ -405,8 +579,8 @@ class MGA:
         """Baseline point z* in ORACLE polytope coordinates.
 
         Uses the baseline design vector frozen in __init__ (the fmax LPs
-        overwrite capacity_addition.solution). The baseline cost is exactly
-        C*, so with normalization=="fmax" the cost coordinate is exactly 0.
+        overwrite the loaded solution). The baseline cost is exactly C*, so the
+        cost coordinate (when include_cost) is exactly 0.
         """
         return self._to_explore_coords(self._z_star_design_raw, self.c_star)
 
@@ -439,11 +613,11 @@ class MGA:
     def compute_fmax_normalization(self) -> None:
         """Compute U_g* = max z_g over the near-optimal polytope, per z-axis.
 
-        Solves one LP per axis (group): same model state as the baseline, plus
-        the near-optimality cost cap (already added by setup()), with the
-        objective replaced by max(sum_{m in group} z_m). U_g* serves dually as
-        (a) the tightest valid per-axis upper bound for the initial outer
-        approximation (Tier 3) and (b) the normalisation denominator z_g / U_g*.
+        Solves one LP per axis: same model state as the baseline, plus the
+        near-optimality cost cap (already added by setup()), with the objective
+        replaced by max(axis value) (kind-aware, see _axis_linexpr). U_g*
+        serves dually as (a) the per-axis upper bound of the initial outer
+        approximation and (b) the normalisation denominator z_g / U_g*.
 
         Cache file layout (JSON):
             {"dataset_hash": "<sha256-prefix>",
@@ -584,45 +758,47 @@ class MGA:
             )
 
         # --- LP loop for axes that need recompute ---
-        agg_dims = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
         for name in recompute_missing + recompute_membership_changed:
             members = members_by_name[name]
-            # Objective: maximise the sum of cap_add over all members of this
-            # axis (and across cap_type/loc/year). For a singleton this is
-            # exactly cap_add[tech].sum(agg_dims) — identical to the legacy LP.
-            obj = (
-                self.cap_add.sel(set_technologies=members)
-                .sum(agg_dims + ["set_technologies"])
-            )
+            kind = self.axis_kind[name]
+            # Objective: maximise the axis's value over the near-optimal space.
+            # Kind-aware (see _axis_linexpr): sum of capacity_addition for a
+            # tech axis, duration-weighted flow_import for a carrier axis.
+            obj = self._axis_linexpr(name)
             self.model.add_objective(obj, sense="max", overwrite=True)
             t0 = time.time()
             self.optimization_setup.solve()
             elapsed = time.time() - t0
             if not self.optimization_setup.optimality:
                 tc = self.model.termination_condition
-                hint = (
-                    "axis is a lumped group; one of its members may be the "
-                    "culprit. Members: " + repr(members)
-                    if len(members) > 1
-                    else "axis is a single technology"
-                )
+                if kind == "carrier_import":
+                    hint = (
+                        "carrier-import axis; an 'unbounded' status means this "
+                        "carrier can be imported at zero/near-zero price within "
+                        "the cost budget. Members: " + repr(members)
+                    )
+                elif len(members) > 1:
+                    hint = (
+                        "lumped tech group; one of its members may be the "
+                        "culprit. Members: " + repr(members)
+                    )
+                else:
+                    hint = "single technology"
                 raise RuntimeError(
                     f"MGA oracle fmax: LP for axis {name!r} did not solve to "
                     f"optimality (termination = {tc!r}). An 'unbounded' status "
-                    f"means this axis has no finite near-optimal maximum "
-                    f"(zero/near-zero cost coefficient and no capacity limit) — "
-                    f"add the offending tech to exclude_techs ({hint})."
+                    f"means this axis has no finite near-optimal maximum — "
+                    f"exclude the offending member ({hint})."
                 )
-            u_i = float(
-                self.cap_add.sel(set_technologies=members).solution.sum()
-            )
+            u_i = self._axis_value(name)
             cached_entries[name] = {
                 "members": sorted(members),
                 "U_star": u_i,
             }
             logging.info(
-                f"MGA oracle fmax: U*[{name}] = {u_i:.6g} (LP took {elapsed:.1f} s, "
-                f"{len(members)} member{'s' if len(members) != 1 else ''})."
+                f"MGA oracle fmax: U*[{name}] = {u_i:.6g} ({kind}, LP took "
+                f"{elapsed:.1f} s, {len(members)} "
+                f"member{'s' if len(members) != 1 else ''})."
             )
 
         # --- Save cache in NEW format (upgrades legacy in place on first run) ---
@@ -684,272 +860,42 @@ class MGA:
         )
 
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
-        """Construct (A0, b0) for the initial outer polytope on z_groups order.
+        """Construct (A0, b0) for the initial outer polytope, in z_groups order.
 
-        Row blocks (in order; n_z = number of GROUPS / exploration axes):
-          1. n_z non-negativity rows  -z_g <= 0
-          2. Tier 1 per-axis upper bounds from two independent model sources;
-             an axis may receive a row from either, both, or neither (the
-             polytope intersection naturally keeps the tighter):
-               2a. `capacity_addition_max[tech, cap_type]` aggregated over
-                   (cap_type, loc, year), then summed across the axis's
-                   members. Group row is emitted only if EVERY member is
-                   bounded from this source.
-               2b. `capacity_limit[tech, cap_type, loc, year]` summed over
-                   (cap_type, loc, year), then summed across the axis's
-                   members. Valid because, per
-                   constraint_technology_lifetime + capacity_limit, every
-                   capacity_addition[h,c,p,y] <= capacity_limit[h,c,p,y]; the
-                   sum runs over ALL years (a short-lifetime tech can retire
-                   and re-add, so a single year's limit is not a valid cap).
-                   Group row emitted only if EVERY member's per-tuple values
-                   are finite.
-          3. One Tier 2 cost-cap row  tilde_c^T z <= (1+eps) * C*. Per-axis
-             coefficient `tilde_c_g = min over members m∈g of tilde_c_m`,
-             where `tilde_c_m = min over (cap_type, loc, year) of the
-             per-tuple cost coefficient` (legacy formula). Derivation: for
-             any feasible x with z_g = sum_{m∈g} sum_j x_{m,j} and
-             tilde_c_g <= c_{m,j} for every m, j,
-                 tilde_c_g z_g = tilde_c_g sum_{m,j} x_{m,j}
-                              <= sum_{m,j} c_{m,j} x_{m,j},
-             and summing over groups gives tilde_c^T z <= c^T x <= (1+eps)C*.
-             For singleton groups this collapses to the legacy per-tech row.
-             Techs without a usable capex parameter contribute tilde_c_m=0,
-             which is also valid.
+        The bounds come from a SINGLE source: the per-axis fmax maxima U_i*
+        (one LP per axis, see compute_fmax_normalization). Row blocks, in order
+        (n_z = number of exploration axes; coordinates are always normalised):
 
-          4. Tier 3 (normalization=="fmax" only): n_z rows  z_i <= U_i*  from
-             the fmax LPs. Provably valid AND tightest; added alongside
-             Tier 1/2 (the polytope intersection keeps the tighter row).
-          5. Cost rows (include_cost only): C <= (1+eps)*C* and -C <= -C*.
+          1. n_z non-negativity rows  -z_i <= 0   (z_i >= 0: capacity_addition
+             and flow_import are both non-negative, so every axis value is too).
+          2. n_z fmax upper-bound rows  z_i <= U_i*. Provably valid (U_i* is by
+             construction the maximum of z_i over the near-optimal space) and
+             tight. This is the whole outer approximation on the design axes.
+          3. Cost rows (include_cost only): C <= (1+eps)*C* and -C <= -C*.
 
-        When normalization=="fmax" the assembled raw polytope is finally
-        mapped to normalised coordinates: A0 <- A0 @ diag(U_tilde),
-        b0 <- b0 - A0_raw @ offset (see _to_explore_coords).
+        The near-optimal cost budget c^T x <= (1+eps)*C* itself lives in the
+        energy-system model (added once by setup()), NOT in this polytope, so
+        it is enforced on every projection solve regardless of these rows.
+
+        The assembled raw polytope is then mapped to normalised coordinates:
+        with z_raw = offset + diag(U_tilde) z_norm, each raw row a^T z_raw <= b
+        becomes (a o U_tilde)^T z_norm <= b - a^T offset (see _to_explore_coords).
+        In normalised coordinates the fmax rows are simply z_norm,i <= 1 and the
+        cost-upper row is C_norm <= 1.
 
         Containment of z* is asserted before returning; a violation raises.
 
         Returns:
             (A0, b0): np.ndarray of shape (n_rows, n_explore) and (n_rows,),
-            in ORACLE polytope coordinates.
+            in ORACLE (normalised) polytope coordinates.
         """
-        es = self.optimization_setup.energy_system
-        params = self.optimization_setup.parameters
         n_z = self.n_z
 
-        # --- Tier 1: per-tech aggregate upper bounds from capacity_addition_max ---
-        cap_add_max = params.capacity_addition_max  # [set_technologies, set_capacity_types]
-        # valid-tuple counts per (tech, cap_type): tuples where the variable exists
-        n_valid = self.cap_add.upper.notnull().sum(
-            ["set_location", "set_time_steps_yearly"]
-        )
-
-        cap_types = list(self.cap_add.coords["set_capacity_types"].values)
-        tier1_rows: list[np.ndarray] = []
-        tier1_b: list[float] = []
-        # Per-tech UB from capacity_addition_max (legacy logic, stored in a
-        # dict keyed by tech for downstream per-group aggregation).
-        per_tech_cam_ub: dict[str, float | None] = {}
-        for tech in self.z_techs:
-            ub = 0.0
-            unbounded = False
-            for c in cap_types:
-                k = int(n_valid.sel(set_technologies=tech, set_capacity_types=c))
-                if k == 0:
-                    # This cap_type isn't used by this tech (no valid tuples).
-                    # The capacity_addition_max value for it is irrelevant.
-                    continue
-                m_val = float(cap_add_max.sel(set_technologies=tech, set_capacity_types=c))
-                if not np.isfinite(m_val) or m_val == 0.0:
-                    # 0 or inf or NaN: the max-cap constraint is masked out at
-                    # solve time, so we have no valid bound on this cap_type.
-                    unbounded = True
-                    break
-                ub += m_val * k
-            per_tech_cam_ub[tech] = None if unbounded else ub
-        # Aggregate to per-group rows: a group is bounded only if ALL its
-        # members are bounded; ub_g = sum_{m in g} per_tech_cam_ub[m]. For
-        # singleton groups this collapses to the legacy per-tech row.
-        for g_idx, (_name, members) in enumerate(self.z_groups):
-            ubs = [per_tech_cam_ub[m] for m in members]
-            if any(u is None for u in ubs):
-                continue
-            row = np.zeros(n_z)
-            row[g_idx] = 1.0
-            tier1_rows.append(row)
-            tier1_b.append(float(sum(ubs)))
-        n_tier1_cam = len(tier1_rows)
-
-        # --- Tier 1b: per-tech aggregate upper bounds from capacity_limit ---
-        # capacity_limit bounds the cumulative `capacity` variable. Via
-        # constraint_technology_lifetime (capacity[h,c,p,y] = existing +
-        # sum_{py in lifetime(y)} capacity_addition[h,c,p,py], with y always in
-        # lifetime(y)) and constraint_technology_capacity_limit (capacity <=
-        # capacity_limit where finite; capacity_addition == 0 where the limit
-        # is already reached), every per-tuple capacity_addition is bounded:
-        # capacity_addition[h,c,p,y] <= capacity_limit[h,c,p,y]. Summing over
-        # (cap_type, loc, year) gives a valid per-tech UB on z_i. The sum runs
-        # over ALL years, not just the last: a short-lifetime tech can add,
-        # retire, and re-add, so total horizon additions are bounded by the
-        # per-year limits summed, not by any single year's limit. (For a
-        # 1-year dataset like cb_small the two coincide.) A row is emitted
-        # only if EVERY model-defined (notnull) tuple is finite.
-        cap_limit = params.capacity_limit
-        # Per-tech UB from capacity_limit (legacy logic; per-group below).
-        per_tech_clim_ub: dict[str, float | None] = {}
-        for tech in self.z_techs:
-            sub = cap_limit.sel(set_technologies=tech)
-            if not bool(sub.notnull().any()):
-                per_tech_clim_ub[tech] = None  # capacity_limit not defined
-            elif bool(np.isinf(sub).any()):
-                per_tech_clim_ub[tech] = None  # at least one +inf tuple
-            else:
-                # skipna: sums finite tuples (incl 0), skips NaN
-                per_tech_clim_ub[tech] = float(sub.sum())
-        # Aggregate to per-group rows (all-or-nothing across members).
-        for g_idx, (_name, members) in enumerate(self.z_groups):
-            ubs = [per_tech_clim_ub[m] for m in members]
-            if any(u is None for u in ubs):
-                continue
-            row = np.zeros(n_z)
-            row[g_idx] = 1.0
-            tier1_rows.append(row)
-            tier1_b.append(float(sum(ubs)))
-        n_tier1_clim = len(tier1_rows) - n_tier1_cam
-
-        # --- Tier 2: per-tech min-under-approximated unit cost ---
-        dr = float(params.discount_rate)
-        ibg = int(es.system.interval_between_years)
-        years = list(es.set_time_steps_yearly)
-        last_horizon = es.set_time_steps_yearly_entire_horizon[-1]
-        # Per-year discount factor, mirroring constraint_net_present_cost.
-        discount_factor: dict[int, float] = {}
-        for y in years:
-            interval = 1 if y == last_horizon else ibg
-            discount_factor[y] = sum(
-                (1.0 / (1.0 + dr)) ** (ibg * (y - years[0]) + i)
-                for i in range(interval)
-            )
-        # Inverted lifetime range is computed per-tech below (depends on
-        # depreciation_time, which is per-tech).
-        from zen_garden.model.technology.technology import Technology
-
-        set_conv = set(es.set_conversion_technologies)
-        set_stor = set(es.set_storage_technologies)
-        set_tran = set(es.set_transport_technologies)
-
-        # Per-tech tilde_c (legacy logic), stored in a dict for per-group min
-        # aggregation below. Techs with no usable capex parameter stay at 0
-        # (vacuously valid under-approximation, just looser).
-        tilde_c_per_tech: dict[str, float] = {t: 0.0 for t in self.z_techs}
-        n_pwa = 0
-        n_no_capex = 0
-        for tech in self.z_techs:
-            # per-tech annuity factor
-            lt = float(params.depreciation_time.sel(set_technologies=tech))
-            if dr != 0.0:
-                a_h = ((1 + dr) ** lt * dr) / ((1 + dr) ** lt - 1)
-            else:
-                a_h = 1.0 / lt
-            # per-tech sum_disc_by_py: depends on depreciation_time
-            tech_sum_disc: dict[int, float] = {py: 0.0 for py in years}
-            for y in years:
-                for py in Technology.get_lifetime_range(
-                    self.optimization_setup, tech, y, use_depreciation_time=True
-                ):
-                    if py in tech_sum_disc:
-                        tech_sum_disc[py] += discount_factor[y]
-            # capex parameter selection by tech type. The actual DataArray
-            # dim names differ across tech types (e.g. conversion uses
-            # 'level_0' for its tech dim, 'year' for years; storage/transport
-            # use the canonical set names). For PWA conversion techs,
-            # capex_specific_conversion is all-NaN/zero and the
-            # finite-positive mask below leaves tilde_c at 0 (valid
-            # under-approximation, just looser).
-            if tech in set_conv:
-                cs_full = params.capex_specific_conversion
-                tech_dim = "level_0" if "level_0" in cs_full.dims else "set_technologies"
-                cs = cs_full.sel({tech_dim: tech})
-                year_dim_name = "year" if "year" in cs.dims else "set_time_steps_yearly"
-            elif tech in set_stor:
-                cs = params.capex_specific_storage.sel(set_storage_technologies=tech)
-                year_dim_name = "set_time_steps_yearly"
-            elif tech in set_tran:
-                cs = params.capex_specific_transport.sel(set_transport_technologies=tech)
-                year_dim_name = "set_time_steps_yearly"
-            else:
-                n_no_capex += 1
-                continue
-            # cs is a DataArray on remaining dims (cap_type/segment, loc/edge, year)
-            cs_vals = cs.values
-            if year_dim_name not in cs.dims:
-                # parameter doesn't have a yearly axis — unexpected; skip Tier 2 for this tech
-                continue
-            year_axis = cs.dims.index(year_dim_name)
-            year_coords = list(cs.coords[year_dim_name].values)
-            disc_vec = np.array(
-                [tech_sum_disc.get(int(yy), 0.0) for yy in year_coords]
-            )
-            # broadcast disc_vec to cs shape on the year axis
-            disc_shape = [1] * cs_vals.ndim
-            disc_shape[year_axis] = len(year_coords)
-            disc_bc = disc_vec.reshape(disc_shape)
-            coeff = cs_vals * a_h * disc_bc
-            # min over finite, positive entries (NaN/0 mean parameter not set
-            # for that tuple — for under-approximation we want a positive lower
-            # bound on unit cost, taken over tuples where the capex actually
-            # applies).
-            finite_pos = np.isfinite(coeff) & (coeff > 0)
-            if not finite_pos.any():
-                if tech in set_conv:
-                    # likely PWA conversion tech
-                    n_pwa += 1
-                tilde_c_per_tech[tech] = 0.0
-            else:
-                tilde_c_per_tech[tech] = float(coeff[finite_pos].min())
-
-        # Per-group Tier 2 coefficient: tilde_c_g = min_{m in g} tilde_c_m.
-        # Algebra: z_g = sum_{m in g} sum_j x_{m,j}; tilde_c_g * z_g <=
-        # sum_{m,j} c_{m,j} x_{m,j} holds iff tilde_c_g <= c_{m,j} for all
-        # m∈g, j, which is tightest at min_{m∈g, j} c_{m,j} =
-        # min_{m∈g} tilde_c_m. For singleton groups this collapses to the
-        # legacy per-tech coefficient.
-        tilde_c = np.array(
-            [
-                min(tilde_c_per_tech[m] for m in members)
-                for _, members in self.z_groups
-            ],
-            dtype=float,
-        )
-
-        # --- Assemble (A0, b0) ---
-        neg_id = -np.eye(n_z)
-        neg_id_b = np.zeros(n_z)
-        rows = [neg_id]
-        b_parts = [neg_id_b]
-        if tier1_rows:
-            rows.append(np.vstack(tier1_rows))
-            b_parts.append(np.array(tier1_b))
-        # Always emit the Tier 2 row even if tilde_c is all zero — the
-        # constraint is vacuous (0 <= (1+eps) C*) but keeps row indexing
-        # consistent and lets the user see in the diagnostic that the
-        # cost-cap row was inactive.
-        rows.append(tilde_c.reshape(1, -1))
-        b_parts.append(np.array([(1.0 + self.epsilon) * self.c_star]))
-
-        A0 = np.vstack(rows)
-        b0 = np.concatenate(b_parts)
-        n_raw_design_rows = A0.shape[0]  # non-negativity + Tier 1 + Tier 2
-
-        # --- Tier 3: per-tech fmax upper bounds  z_i <= U_i*  (fmax only) ---
-        # Provably valid (U_i* is by construction the max of z_i over the
-        # near-optimal polytope) and provably tightest. Added ALONGSIDE
-        # Tier 1/2, not instead of them: the polytope intersection keeps the
-        # tightest row per axis, so the change is additive and reversible.
-        n_tier3 = 0
-        if self.normalization == "fmax":
-            A0 = np.vstack([A0, np.eye(n_z)])
-            b0 = np.concatenate([b0, self.u_star])
-            n_tier3 = n_z
+        # --- Raw design rows: non-negativity + fmax upper bounds ---
+        #   -z_i <= 0           (non-negativity)
+        #    z_i <= U_i*        (fmax box)
+        A0 = np.vstack([-np.eye(n_z), np.eye(n_z)])
+        b0 = np.concatenate([np.zeros(n_z), self.u_star])
 
         # --- Cost coordinate: 2 rows  C <= (1+eps)C*  and  -C <= -C*  ---
         if self.include_cost:
@@ -962,14 +908,13 @@ class MGA:
                 [b0, [(1.0 + self.epsilon) * self.c_star], [-self.c_star]]
             )
 
-        # --- Normalisation transform (fmax only) ---
+        # --- Normalisation transform (always on for ORACLE) ---
         # Each raw row  a^T z_raw <= b  with z_raw = offset + diag(U_tilde) z_norm
         # becomes  (a o U_tilde)^T z_norm <= b - a^T offset.
-        if self.normalization == "fmax":
-            b0 = b0 - A0 @ self._offset       # uses raw A0 — must precede scaling
-            A0 = A0 @ np.diag(self._u_tilde)
+        b0 = b0 - A0 @ self._offset       # uses raw A0 — must precede scaling
+        A0 = A0 @ np.diag(self._u_tilde)
 
-        # --- Sanity assert: A0 @ z*_explore <= b0  (containment, A5/B8) ---
+        # --- Sanity assert: A0 @ z*_explore <= b0  (containment) ---
         z_star = self.z_star_explore
         lhs = A0 @ z_star
         abs_tol = 1e-6 * (np.abs(b0) + 1.0)
@@ -980,38 +925,24 @@ class MGA:
                 f"MGA initial outer approximation violates containment of z*: "
                 f"row {i}: lhs={lhs[i]:.6g} > rhs={b0[i]:.6g} "
                 f"(slack {lhs[i] - b0[i]:.3g}). Row blocks: [0,{n_z}) "
-                f"non-negativity, [{n_z},{n_raw_design_rows}) Tier 1/2, "
-                f"[{n_raw_design_rows},{n_raw_design_rows + n_tier3}) Tier 3 fmax, "
+                f"non-negativity, [{n_z},{2 * n_z}) fmax upper bounds, "
                 f"remaining rows cost upper/lower."
             )
 
         # --- Diagnostic logging ---
-        ratio = (
-            float(tilde_c @ self._z_star_design_raw / self.c_star)
-            if self.c_star else 0.0
-        )
         n_cost_rows = 2 if self.include_cost else 0
-        n_lumps = sum(1 for _, m in self.z_groups if len(m) > 1)
+        n_tech = sum(1 for k in self.axis_kind.values() if k == "tech_capacity")
+        n_carrier = self.n_z - n_tech
         logging.info(
-            f"MGA outer approximation [normalization={self.normalization}, "
-            f"include_cost={self.include_cost}]: n_explore={A0.shape[1]} "
-            f"(n_z={n_z} axes = {n_z - n_lumps} singletons + {n_lumps} lumps"
-            f"{', + 1 cost' if self.include_cost else ''}), "
-            f"rows={A0.shape[0]} = {n_z} non-neg + {len(tier1_rows)} Tier 1 "
-            f"(cap_add_max {n_tier1_cam}, cap_limit {n_tier1_clim}) + 1 Tier 2 "
-            f"+ {n_tier3} Tier 3 fmax + {n_cost_rows} cost. "
-            f"tilde_c @ z*_raw / C* = {ratio:.4g} (raw units; should be in "
-            f"(0,1]; axes with non-zero tilde_c: {int((tilde_c > 0).sum())}/{n_z}; "
-            f"member techs with tilde_c=0 from PWA-conversion: {n_pwa}; "
-            f"member techs not classifiable as conv/stor/tran: {n_no_capex})."
+            f"MGA outer approximation [include_cost={self.include_cost}]: "
+            f"n_explore={A0.shape[1]} (n_z={n_z} axes = {n_tech} tech + "
+            f"{n_carrier} carrier{', + 1 cost' if self.include_cost else ''}), "
+            f"rows={A0.shape[0]} = {n_z} non-neg + {n_z} fmax upper "
+            f"+ {n_cost_rows} cost. Coordinates NORMALISED (z/U*): design axes "
+            f"dimensionless with near-optimal range [0,1]"
+            + ("; cost axis = (C-C*)/(eps*C*), range [0,1]." if self.include_cost
+               else ".")
         )
-        if self.normalization == "fmax":
-            logging.info(
-                "MGA outer approximation: coordinates NORMALISED — A0/b0, the "
-                "projection LP and the L-inf convergence metric all operate in "
-                "z/U* space (design axes dimensionless, near-optimal range "
-                "[0,1]); cost axis = (C-C*)/(eps*C*), near-optimal range [0,1]."
-            )
         return A0, b0
 
     def _solve_and_postprocess(self, label: str) -> None:
@@ -1085,40 +1016,35 @@ class MGA:
     def setup_projection_model(self) -> None:
         """Add the L-infinity projection model to the linopy model.
 
-        The per-axis dim name is chosen conditionally:
-          - ``set_technologies`` when every z-axis is a singleton with name ==
-            tech name (legacy + bare-string-only include_techs). Byte-identical
-            to today.
-          - ``mga_z_axis`` when at least one lumped group exists, because
-            lumped names like ``"ccs_lump"`` are not valid coord values on
-            cap_add's ``set_technologies`` dim and would cause xarray
-            alignment confusion.
-        The chosen name is stored as ``self._z_dim`` and reused in
-        find_nearest_point.
+        The per-axis dim name self._z_dim is chosen conditionally:
+          - ``set_technologies`` when every z-axis is a singleton tech (name ==
+            tech name): the proven vectorised path, byte-identical to today.
+          - ``mga_z_axis`` otherwise (tech lumps and/or carrier axes), because
+            lumped/carrier names are not valid coord values on cap_add's
+            ``set_technologies`` dim.
 
-        New variables:
-            mga_oracle_delta:      vector on self._z_dim (z_names), free.
-            mga_oracle_t:          scalar (trivial dim), lower=0.
-            mga_oracle_delta_cost: scalar (trivial dim), free — include_cost only.
+        Projection-equality construction also branches:
+          - No carrier axis: ONE vectorised constraint mga_oracle_proj_eq
+            (Sx - delta == trial), Sx built from cap_add via a selector matrix
+            (tech lumps) or a plain .sel (pure singletons). Unchanged.
+          - Any carrier axis: capacity_addition and flow_import cannot share a
+            single vectorised selector, so one named scalar equality PER axis,
+            mga_oracle_proj_eq_axis{i}: axis_expr_i - delta[i] == trial_i, with
+            axis_expr_i from the kind-aware _axis_linexpr. delta stays a vector
+            for the (vectorised) t-constraints.
 
-        New constraints (paper's z_f variable is eliminated by substitution:
-        Sx = z_f and z_O - z_f = delta combine into Sx - delta == z_O):
-            mga_oracle_proj_eq:  Sx - delta == trial   (RHS updated per iter)
-            mga_oracle_t_pos:    d_scale o delta - t*1 <= 0
-            mga_oracle_t_neg:  -(d_scale o delta) - t*1 <= 0
-        With normalization=="fmax", d_scale_g = 1/U_g*, so min t gives the
-        NORMALISED L-inf distance directly; with "none", d_scale = 1 and the
-        constraints reduce to the historical raw form.
+        Coordinates are ALWAYS normalised: d_scale_g = 1/U_g* in the t-bounds,
+        so min t = max_g |delta_g|/U_g* = the normalised L-inf distance.
 
-        include_cost adds a parallel cost track sharing the same t:
-            mga_oracle_proj_eq_cost: C(x) - delta_cost == trial_C
-            mga_oracle_t_pos_cost:   c_scale*delta_cost - t*1 <= 0
-            mga_oracle_t_neg_cost: -(c_scale*delta_cost) - t*1 <= 0
-        with c_scale = 1/(eps*C*) (fmax) or 1 (none).
+        Variables: mga_oracle_delta (vector on _z_dim), mga_oracle_t (scalar),
+        and mga_oracle_delta_cost (scalar, include_cost only). The cost track
+        (mga_oracle_proj_eq_cost + t-bounds, c_scale = 1/(eps*C*)) is unchanged.
 
         Call exactly once before the ORACLE loop.
         """
-        # Dim-name choice (see docstring).
+        # Pure singleton-tech runs keep the set_technologies dim (byte-identical
+        # proven path); anything else (tech lumps or carrier axes) uses a fresh
+        # dim, since those axis names are not cap_add tech coords.
         self._z_dim = "mga_z_axis" if self._has_lumped_groups else "set_technologies"
 
         z_coord = xr.DataArray(
@@ -1145,56 +1071,57 @@ class MGA:
             lower=0.0,
         )
 
-        # S*x as a LinearExpression on the per-axis dim.
-        if self._has_lumped_groups:
-            # 2-D selector matrix: 1.0 at (member_tech, axis_name) for each
-            # group's members, 0 elsewhere. Multiplying by cap_add and summing
-            # over set_technologies + (c,l,y) reduces cap_add to a LinearExpr
-            # on mga_z_axis with one entry per group — the sum of cap_add over
-            # all member techs and all (cap_type, loc, year) tuples.
-            all_techs = list(self.cap_add.coords["set_technologies"].values)
-            selector = xr.DataArray(
-                np.zeros((len(all_techs), self.n_z)),
-                dims=("set_technologies", self._z_dim),
-                coords={"set_technologies": all_techs,
-                        self._z_dim: self.z_names},
-            )
-            for _g_idx, (name, members) in enumerate(self.z_groups):
-                for m in members:
-                    selector.loc[
-                        {"set_technologies": m, self._z_dim: name}
-                    ] = 1.0
-            Sx = (selector * self.cap_add).sum(
-                ["set_technologies", "set_capacity_types",
-                 "set_location", "set_time_steps_yearly"]
-            )
+        if self.has_carrier_axis:
+            # --- Per-axis named equality constraints (mixed variable kinds) ---
+            # One scalar constraint per axis: axis_expr_i - delta[i] == trial_i.
+            # RHS updated per iteration in find_nearest_point.
+            for i, name in enumerate(self.z_names):
+                expr = self._axis_linexpr(name)
+                self.model.add_constraints(
+                    expr - self.delta.sel({self._z_dim: name}) == 0.0,
+                    name=f"mga_oracle_proj_eq_axis{i}",
+                )
         else:
-            # Legacy path: every axis is a singleton tech, so z_names ==
-            # z_techs and the per-axis dim IS set_technologies — the cap_add
-            # filtering pattern below is byte-identical to today.
-            Sx = self.cap_add.sel(set_technologies=self.z_techs).sum(
-                ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+            # --- Vectorised path (tech-only; proven, byte-identical) ---
+            if self._has_lumped_groups:
+                # 2-D selector matrix: 1.0 at (member_tech, axis_name) for each
+                # group's members. Multiplying by cap_add and summing reduces it
+                # to a LinearExpr on mga_z_axis, one entry per axis.
+                all_techs = list(self.cap_add.coords["set_technologies"].values)
+                selector = xr.DataArray(
+                    np.zeros((len(all_techs), self.n_z)),
+                    dims=("set_technologies", self._z_dim),
+                    coords={"set_technologies": all_techs,
+                            self._z_dim: self.z_names},
+                )
+                for _g_idx, (name, members) in enumerate(self.z_groups):
+                    for m in members:
+                        selector.loc[
+                            {"set_technologies": m, self._z_dim: name}
+                        ] = 1.0
+                Sx = (selector * self.cap_add).sum(
+                    ["set_technologies", "set_capacity_types",
+                     "set_location", "set_time_steps_yearly"]
+                )
+            else:
+                # Pure singletons: dim IS set_technologies, byte-identical.
+                Sx = self.cap_add.sel(set_technologies=self.z_techs).sum(
+                    ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+                )
+            zero_trial = xr.DataArray(
+                np.zeros(self.n_z),
+                dims=self._z_dim,
+                coords={self._z_dim: self.z_names},
+            )
+            self.model.add_constraints(
+                Sx - self.delta == zero_trial, name="mga_oracle_proj_eq"
             )
 
-        # Initial trial RHS: zero vector. Will be overwritten in find_nearest_point.
-        zero_trial = xr.DataArray(
-            np.zeros(self.n_z),
-            dims=self._z_dim,
-            coords={self._z_dim: self.z_names},
-        )
-
-        self.model.add_constraints(Sx - self.delta == zero_trial, name="mga_oracle_proj_eq")
-
-        # Per-axis L-inf scaling. With normalization=="fmax", d_scale_g = 1/U_g*
-        # so  min t  yields t* = max_g |delta_g|/U_g* = the NORMALISED L-inf
-        # distance. With "none", d_scale = 1 and the constraints reduce to the
-        # historical raw form.
-        if self.normalization == "fmax":
-            d_scale_vals = 1.0 / self.u_star
-        else:
-            d_scale_vals = np.ones(self.n_z)
+        # Per-axis L-inf scaling: d_scale_g = 1/U_g* (normalisation always on),
+        # so min t yields t* = max_g |delta_g|/U_g* = the normalised L-inf
+        # distance. Vectorised over the whole delta vector in both paths.
         d_scale = xr.DataArray(
-            d_scale_vals,
+            1.0 / self.u_star,
             dims=self._z_dim,
             coords={self._z_dim: self.z_names},
         )
@@ -1225,7 +1152,7 @@ class MGA:
                 cost_expr - self.delta_cost == zero_cost,
                 name="mga_oracle_proj_eq_cost",
             )
-            c_scale = 1.0 / (self.epsilon * self.c_star) if self.normalization == "fmax" else 1.0
+            c_scale = 1.0 / (self.epsilon * self.c_star)
             self.model.add_constraints(
                 c_scale * self.delta_cost - self.t_var <= 0,
                 name="mga_oracle_t_pos_cost",
@@ -1237,19 +1164,20 @@ class MGA:
 
         logging.info(
             f"MGA oracle: projection model added (n_z = {self.n_z} axes on "
-            f"dim {self._z_dim!r}, normalization = {self.normalization!r}, "
+            f"dim {self._z_dim!r}, proj-eq path = "
+            f"{'per-axis' if self.has_carrier_axis else 'vectorised'}, "
             f"include_cost = {self.include_cost})"
         )
 
     def find_nearest_point(self, trial_point: np.ndarray):
         """Callback for pyoNearOpt ORACLE.
 
-        trial_point arrives in ORACLE polytope coordinates: normalised when
-        normalization=="fmax", augmented with a cost coordinate (last entry)
-        when include_cost. Returns (z_feas, dist, mu_cut, b_cut, flag) in the
-        SAME coordinates; mu_cut is L2-normalised and b_cut = mu_cut @ z_feas.
+        trial_point arrives in ORACLE polytope coordinates (always normalised;
+        augmented with a cost coordinate as the last entry when include_cost).
+        Returns (z_feas, dist, mu_cut, b_cut, flag) in the SAME coordinates;
+        mu_cut is L2-normalised and b_cut = mu_cut @ z_feas.
 
-        Coordinate algebra (normalization=="fmax"):
+        Coordinate algebra:
             trial_raw = offset + trial_norm * U_tilde         (proj-eq RHS)
             dist      = t*  — the projection LP minimises the NORMALISED
                         L-inf distance directly (scaled t-constraints), so no
@@ -1265,25 +1193,26 @@ class MGA:
             )
 
         # --- Design axes: trial point -> raw coordinates, set proj-eq RHS ---
-        trial_design = trial_point[:self.n_z]
-        if self.normalization == "fmax":
-            trial_design_raw = trial_design * self.u_star
+        # trial_design_raw = trial_norm * U_g* (the design offset is 0).
+        trial_design_raw = trial_point[:self.n_z] * self.u_star
+        if self.has_carrier_axis:
+            # Per-axis named scalar equality: set each RHS to its raw trial value.
+            for i in range(self.n_z):
+                self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].rhs = float(
+                    trial_design_raw[i]
+                )
         else:
-            trial_design_raw = trial_design
-        trial_da = xr.DataArray(
-            trial_design_raw,
-            dims=self._z_dim,
-            coords={self._z_dim: self.z_names},
-        )
-        self.model.constraints["mga_oracle_proj_eq"].rhs = trial_da
+            trial_da = xr.DataArray(
+                trial_design_raw,
+                dims=self._z_dim,
+                coords={self._z_dim: self.z_names},
+            )
+            self.model.constraints["mga_oracle_proj_eq"].rhs = trial_da
 
         # --- Cost axis: trial point -> raw cost, set cost proj-eq RHS ---
         if self.include_cost:
             trial_c = float(trial_point[self.n_z])
-            if self.normalization == "fmax":
-                trial_c_raw = self.c_star + trial_c * self.epsilon * self.c_star
-            else:
-                trial_c_raw = trial_c
+            trial_c_raw = self.c_star + trial_c * self.epsilon * self.c_star
             trial_c_da = xr.DataArray(
                 np.array([trial_c_raw]),
                 dims="mga_oracle_scalar_dim",
@@ -1305,27 +1234,36 @@ class MGA:
         # z_feas in polytope coordinates (already normalised/augmented).
         z_feas = self._extract_z()
 
-        # dist = t* = the (normalised) L-inf projection distance.
+        # dist = t* = the normalised L-inf projection distance.
         dist = float(self.t_var.solution.values[0])
 
         # --- Cutting hyperplane: dual of the projection equality, rescaled ---
         # mu_raw = dual of the raw proj eq (sign convention matches scipy
-        # linprog eqlin.marginals). mu_norm = mu_raw o U_tilde.
-        mu_design_raw = (
-            self.model.constraints["mga_oracle_proj_eq"].dual
-            .sel({self._z_dim: self.z_names})
-            .values
-        )
-        if self.normalization == "fmax":
-            mu_cut = mu_design_raw * self.u_star
+        # linprog eqlin.marginals). mu_norm = mu_raw o U_g*.
+        if self.has_carrier_axis:
+            mu_design_raw = np.array(
+                [
+                    float(
+                        self.model.constraints[f"mga_oracle_proj_eq_axis{i}"]
+                        .dual.values
+                    )
+                    for i in range(self.n_z)
+                ],
+                dtype=float,
+            )
         else:
-            mu_cut = np.asarray(mu_design_raw, dtype=float)
+            mu_design_raw = (
+                self.model.constraints["mga_oracle_proj_eq"].dual
+                .sel({self._z_dim: self.z_names})
+                .values
+            )
+        mu_cut = np.asarray(mu_design_raw, dtype=float) * self.u_star
 
         if self.include_cost:
             mu_c_raw = float(
                 self.model.constraints["mga_oracle_proj_eq_cost"].dual.values[0]
             )
-            mu_c = mu_c_raw * self.epsilon * self.c_star if self.normalization == "fmax" else mu_c_raw
+            mu_c = mu_c_raw * self.epsilon * self.c_star
             mu_cut = np.append(mu_cut, mu_c)
 
         # L2-normalise the (already coordinate-scaled) cut normal, then take
@@ -1337,8 +1275,8 @@ class MGA:
 
         logging.info(
             f"MGA oracle iter {self._iter_count}: dist = {dist:.4g} "
-            f"({'normalised' if self.normalization == 'fmax' else 'raw'} L-inf), "
-            f"|mu|_max = {np.max(np.abs(mu_cut)):.4g}, b_cut = {b_cut:.4g}"
+            f"(normalised L-inf), |mu|_max = {np.max(np.abs(mu_cut)):.4g}, "
+            f"b_cut = {b_cut:.4g}"
         )
         self._iter_count += 1
         return z_feas, dist, mu_cut, b_cut, 0
@@ -1355,17 +1293,16 @@ def run_mga(*args, **kwargs):
     epsilon = config["epsilon"]
     exclude_techs = config.get("exclude_techs", [])
     include_techs = config.get("include_techs", [])
+    include_carrier_imports = config.get("include_carrier_imports", [])
 
-    # Oracle exploration-coordinate options. Read here so MGA is built
-    # uniformly across modes; non-oracle modes leave the oracle block empty,
-    # so they get normalization="none"/include_cost=False and are unaffected.
+    # Oracle exploration-coordinate options. ORACLE always normalises by the
+    # per-axis fmax maxima — there is no longer a normalization knob.
     ora_cfg = config.get("oracle", {})
-    normalization = ora_cfg.get("normalization", "none")
     include_cost = bool(ora_cfg.get("include_cost", False))
-    if normalization not in ("none", "fmax"):
-        raise ValueError(
-            f"MGA: oracle.normalization must be 'none' or 'fmax', "
-            f"got {normalization!r}"
+    if "normalization" in ora_cfg:
+        logging.info(
+            "MGA oracle: the 'normalization' config key is deprecated and "
+            "ignored — normalization is always on for ORACLE."
         )
 
     optimization_setup = kwargs["optimization_setup"]
@@ -1378,14 +1315,16 @@ def run_mga(*args, **kwargs):
     }
     logging.info(
         f"MGA plugin: mode = {mode!r}, epsilon = {epsilon}, "
-        f"n_exclude = {len(exclude_techs)}, n_include = {len(include_techs)}"
+        f"n_exclude = {len(exclude_techs)}, n_include = {len(include_techs)}, "
+        f"n_carrier_imports = {len(include_carrier_imports)}"
     )
 
     mga = MGA(
         optimization_setup, epsilon, postprocess_ctx,
         exclude_techs=exclude_techs,
         include_techs=include_techs,
-        normalization=normalization, include_cost=include_cost,
+        include_carrier_imports=include_carrier_imports,
+        include_cost=include_cost,
     )
     mga.setup()
 
@@ -1406,48 +1345,12 @@ def run_mga(*args, **kwargs):
             mga.run_iteration(weights, i)
 
     elif mode == "random_directions":
-        from pyoNearOpt.exploration_methods.random import random_directions
-        from pyoNearOpt.polytope_approximation.approximation_class import approximation
-
-        rd_cfg = config.get("random_directions", {})
-        n_iter = rd_cfg.get("n_iterations", 50)
-        seed = rd_cfg.get("seed", None)
-        if seed is not None:
-            np.random.seed(seed)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=".*Coordinates across variables not equal.*",
-                category=UserWarning,
-            )
-            z_star = mga._extract_z()
-            A0, b0 = mga.build_initial_outer_approximation()
-
-            poly = approximation(
-                A=A0, X=z_star.reshape(1, -1), b=b0,
-                name_list=list(mga.z_names),
-                use_bigM=False,
-            )
-
-            rd = random_directions(support_function=mga.support_function, poly_approx=poly)
-            rd.explore(n_iter=n_iter)
-
-        # Summary folder lands inside folder_output, as a sibling of the
-        # per-iteration Postprocess folders. postprocess_ctx["subfolder"] is
-        # only a relative sub-path (empty for non-scenario runs), so using it
-        # alone would resolve against the process cwd instead.
-        out = (
-            Path(optimization_setup.analysis.folder_output)
-            / f"{postprocess_ctx['model_name']}_random_dir_summary"
+        raise NotImplementedError(
+            "MGA random_directions mode was retired when the legacy "
+            "capacity-based outer-approximation bounds were removed; the fmax "
+            "box (ORACLE-only) is now the sole bound source, and "
+            "random_directions never ran the fmax LPs. Use mode='oracle'."
         )
-        out.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            out / "polytope.npz",
-            A=poly.A, b=poly.b, X=poly.X,
-            name_list=np.array(poly.name_list),
-        )
-        logging.info(f"MGA random_directions: complete. Polytope saved to {out}")
 
     elif mode == "oracle":
         from pyoNearOpt.exploration_methods.ORACLE import oracle as ORACLEAlgorithm
@@ -1461,19 +1364,10 @@ def run_mga(*args, **kwargs):
         Md_override = ora_cfg.get("Md_override", 1e8)
         t_max_override = ora_cfg.get("t_max_override", None)
 
-        if mga.include_cost and mga.normalization != "fmax":
-            logging.warning(
-                "MGA oracle: include_cost=True with normalization=%r — the cost "
-                "coordinate (~1e6 MEUR raw) is orders of magnitude larger than "
-                "the design coordinates, so the L-inf metric will collapse onto "
-                "the cost axis. Strongly recommended: set "
-                "oracle.normalization='fmax'.", mga.normalization
-            )
-
         # fmax: solve the n_z auxiliary U_i* LPs (cached on disk) BEFORE the
-        # projection model is added and before the ORACLE loop starts.
-        if mga.normalization == "fmax":
-            mga.compute_fmax_normalization()
+        # projection model is added and before the ORACLE loop starts. These
+        # supply both the normalisation denominators and the initial outer box.
+        mga.compute_fmax_normalization()
 
         # Add projection model to the linopy problem (ONCE).
         mga.setup_projection_model()
@@ -1510,7 +1404,7 @@ def run_mga(*args, **kwargs):
         pyomo_solver = pyo.SolverFactory(
             "gurobi", solver_io="python", manage_env=True
         )
-        pyomo_solver.set_options("OutputFlag=0")
+        pyomo_solver.set_options("OutputFlag=1 MIPGap=0.05")
 
         algo = ORACLEAlgorithm(
             poly_approx=poly,
