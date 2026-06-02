@@ -1,134 +1,15 @@
-import linopy as lp
 import pandas as pd
-import numpy as np
-import xarray as xr
-import json
-from pathlib import Path
-import logging
 from tqdm import tqdm
 
 from zen_garden.plugin_system.events import Event, EventPublisher
-
+from zen_garden.plugins.mean_variance_optimization.helpers import calculate_absolute_sd, calculate_correlation_matrix, \
+    generate_covariance_pairs
 
 config = {
     "weighting_factor": None,
     "include_variances_for": ["technology_capex", "technology_opex", "import", "export", "demand_shedding"],
 }
 
-
-def _get_capex_specific(optimization_setup):
-    """
-    Reads all capex parameters from the optimization setup.
-    """
-    capex_specific_conversion = optimization_setup.parameters.capex_specific_conversion
-    capex_specific_conversion = capex_specific_conversion.rename(
-        {'level_0': 'set_technologies',
-         'node': 'set_location',
-         'year': 'set_time_steps_yearly'}
-    )
-    capex_specific_conversion = capex_specific_conversion.expand_dims(
-        {"set_capacity_types": ["energy"]}
-    )
-    capex_specific_storage = optimization_setup.parameters.capex_specific_storage
-    capex_specific_storage = capex_specific_storage.rename(
-        {'set_storage_technologies': 'set_technologies',
-         'set_nodes': 'set_location'}
-    )
-
-    capex_specific_transport = optimization_setup.parameters.capex_specific_transport
-    capex_specific_transport = capex_specific_transport.rename(
-        {'set_transport_technologies': 'set_technologies',
-         'set_edges': 'set_location'}
-    )
-    capex_specific_transport = capex_specific_transport.expand_dims(
-        {"set_capacity_types": ["power"]}
-    )
-
-    capex_specific = xr.concat(
-        [
-            capex_specific_conversion,
-            capex_specific_storage,
-            capex_specific_transport,
-        ],
-        dim="set_technologies",
-        join="outer"
-    )
-    return capex_specific
-
-def _get_sd(optimization_setup):
-    """
-    Reads all sd values from file
-    """
-    tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
-    technologies = list(optimization_setup.sets["set_technologies"])
-
-    sd = pd.read_csv(tech_capex_path / "sd.csv", index_col=0)
-
-    sd_xr = xr.DataArray(
-        sd.loc[technologies, "value"].values,
-        dims=("set_technologies",),
-        coords={"set_technologies": technologies},
-    )
-
-    return sd_xr
-
-
-def _get_correlation(optimization_setup):
-    """
-    Reads all correlations from file and preprocess them
-    """
-    tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
-    technologies = list(optimization_setup.sets["set_technologies"])
-    time_steps_yearly = optimization_setup.sets["set_time_steps_yearly"]
-    nodes = list(optimization_setup.sets["set_nodes"])
-    edges = list(optimization_setup.sets["set_edges"])
-
-    correlation_df = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
-    correlation_np = correlation_df.to_numpy()
-    lam = 1e-4
-    correlation_reg = (1 - lam) * correlation_np + lam * np.eye(correlation_np.shape[0])
-    correlation = pd.DataFrame(
-        correlation_reg,
-        index=correlation_df.index,
-        columns=correlation_df.index
-    )
-
-    auto_correlation = pd.read_csv(tech_capex_path / "autocorrelation.csv", index_col=0)
-
-    # Correlation matrix
-    corr_xr = xr.DataArray(
-        correlation.loc[technologies, technologies].values,
-        dims=("set_technologies_i", "set_technologies_j"),
-        coords={
-            "set_technologies_i": technologies,
-            "set_technologies_j": technologies,
-        },
-    )
-
-    # Autocorrelation matrix
-    auto_corr_xr = xr.DataArray(
-        auto_correlation.loc[technologies, "value"].values,
-        dims=("set_technologies",),
-        coords={"set_technologies": technologies},
-    )
-    time_xr = xr.DataArray(
-        time_steps_yearly,
-        dims=("set_time_steps_yearly",),
-        coords={"set_time_steps_yearly": time_steps_yearly},
-    )
-    dt = abs(
-        time_xr.rename(set_time_steps_yearly="set_time_steps_yearly_i")
-        - time_xr.rename(set_time_steps_yearly="set_time_steps_yearly_j")
-    )
-    time_corr = auto_corr_xr ** dt
-
-    # Full correlation
-    full_corr = (
-            corr_xr
-            * time_corr.rename(set_technologies="set_technologies_i")
-    )
-
-    return full_corr
 
 def _only_technology_correlation(optimization_setup, quadratic_term):
     """Simplified variance term: aggregate capacity additions over locations and time steps,
@@ -166,37 +47,16 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
             name="constraint_capacity_addition_tech_agg",
         )
 
-    # Calculate absolute SD per technology
-    capex_specific_xr = _get_capex_specific(optimization_setup)
-    relative_sd_xr = _get_sd(optimization_setup)
-    absolute_sd_xr = (capex_specific_xr * relative_sd_xr).stack(
-        all_dims=["set_technologies", "set_location", "set_time_steps_yearly", "set_capacity_types"]
-    ).dropna("all_dims")
-    absolute_sd_per_tech = (
-        absolute_sd_xr.to_series()
-        .groupby(level=["set_technologies", "set_capacity_types"])
-        .mean()
-        .dropna()
-    )
-    absolute_sd_per_tech = absolute_sd_per_tech[absolute_sd_per_tech != 0]
+    # Absolute SD per technology
+    absolute_sd_per_tech = calculate_absolute_sd(optimization_setup)
 
-    # Calculate correlation per technology
-    corr_xr = _get_correlation(optimization_setup)
-    corr_series = (
-        corr_xr.to_series()
-        .groupby(level=["set_technologies_i", "set_technologies_j"])
-        .mean()
-        .dropna()
-    )
-    corr_series = corr_series[corr_series != 0]
-    corr_df = corr_series.reset_index()
-    corr_df.columns = ["tech_i", "tech_j", "correlation"]
+    # Correlation per technology pair
+    corr_df = calculate_correlation_matrix(optimization_setup)
 
-    # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation #
-    valid_tech_cap = set(absolute_sd_per_tech.index)
-    valid_df = pd.DataFrame(list(valid_tech_cap), columns=["tech", "cap"])
-    pairs = valid_df.add_suffix("_i").merge(valid_df.add_suffix("_j"), how="cross")
-    pairs = pairs.merge(corr_df, on=["tech_i", "tech_j"], how="inner")
+    # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
+    pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
+
+    # Get weighting factor
     weighting_factor = config.get("weighting_factor")
 
     # Quadratic term using the auxiliary variable                     #
@@ -217,15 +77,66 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
 
     return quadratic_term
 
+
+@EventPublisher.register(Event.after_postprocessing)
+def calculate_variance_from_solution(postprocessing=None):
+    """Compute the realized capex variance from the solved capacity_addition values.
+
+    Variance = Σ_{i,j} ρ_{ij} · σ_i · σ_j · C_i · C_j
+
+    where C_k = Σ_{loc, t} capacity_addition[tech_k, cap_k, loc, t]  (from solution).
+
+    The scalars are injected into ``model._solution`` so that ``save_var`` exports
+    them automatically as ``capex_variance`` and ``capex_sd``.
+    """
+    # Absolute SD per technology
+    absolute_sd_per_tech = calculate_absolute_sd(postprocessing.optimization_setup)
+
+    # Correlation per technology pair
+    corr_df = calculate_correlation_matrix(postprocessing.optimization_setup)
+
+    # Build upper-triangle (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
+    pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
+
+    # Solved capacity additions → aggregate over locations and time steps
+    capacity_addition_sol = (
+        postprocessing.optimization_setup.model.variables["capacity_addition"]
+        .solution
+        .sum(["set_location", "set_time_steps_yearly"])
+    )
+
+    variance = 0.0
+    for _, row in pairs.iterrows():
+        tech_i, cap_i = row["tech_i"], row["cap_i"]
+        tech_j, cap_j = row["tech_j"], row["cap_j"]
+        correlation = row["correlation"]
+        factor = row.get("factor", 1)
+
+        sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
+        sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
+
+        C_i = float(capacity_addition_sol.sel(set_technologies=tech_i, set_capacity_types=cap_i))
+        C_j = float(capacity_addition_sol.sel(set_technologies=tech_j, set_capacity_types=cap_j))
+
+        variance += factor * correlation * sigma_i * sigma_j * C_i * C_j
+
+    plugin_reporting = {}
+    plugin_reporting["standard_deviation"]= variance ** 0.5
+
+
+    postprocessing.write_file(postprocessing.name_dir.joinpath("mean_variance_dict"), plugin_reporting, mode="w", format = "json")
+
+
 @EventPublisher.register(Event.after_model_construction)
 def construct_mean_variance_objective(optimization_setup=None):
 
 
     quadratic_term = 0
 
-    if "technology_capex" in config.get("include_variances_for"):
-        # quadratic_term = _spatial_and_time_correlation(optimization_setup, quadratic_term)
-        quadratic_term = _only_technology_correlation(optimization_setup, quadratic_term)
+    weighting_factor = config.get("weighting_factor")
+    if weighting_factor:
+        if "technology_capex" in config.get("include_variances_for"):
+            quadratic_term = _only_technology_correlation(optimization_setup, quadratic_term)
 
 
     optimization_setup.model.remove_objective()
@@ -235,4 +146,7 @@ def construct_mean_variance_objective(optimization_setup=None):
     objective = quadratic_term + npv_term
     sense = "min"
     optimization_setup.model.add_objective(objective, sense=sense)
+
+
+
 

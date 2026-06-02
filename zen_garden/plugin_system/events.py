@@ -58,6 +58,7 @@ class Event(Enum):
 
 
     after_model_construction = auto()
+    after_postprocessing = auto()
 
 
 class EventPublisher:

@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from tables import NaturalNameWarning
 
 from ..optimization_setup import OptimizationSetup
+from zen_garden.plugin_system.events import EventPublisher, Event
 
 # Warnings
 warnings.filterwarnings("ignore", category=NaturalNameWarning)
@@ -101,6 +102,8 @@ class Postprocess:
         self.save_param_map()
         if self.solver.run_diagnostics:
             self.save_benchmarking_data()
+
+        EventPublisher.trigger(Event.after_postprocessing, postprocessing=self)
 
     def write_file(self, name, dictionary, format=None, mode="w"):
         """Writes the dictionary to file as json, if compression attribute is
