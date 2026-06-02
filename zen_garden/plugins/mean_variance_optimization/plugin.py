@@ -110,7 +110,6 @@ def calculate_variance_from_solution(postprocessing=None):
         tech_i, cap_i = row["tech_i"], row["cap_i"]
         tech_j, cap_j = row["tech_j"], row["cap_j"]
         correlation = row["correlation"]
-        factor = row.get("factor", 1)
 
         sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
         sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
@@ -118,9 +117,10 @@ def calculate_variance_from_solution(postprocessing=None):
         C_i = float(capacity_addition_sol.sel(set_technologies=tech_i, set_capacity_types=cap_i))
         C_j = float(capacity_addition_sol.sel(set_technologies=tech_j, set_capacity_types=cap_j))
 
-        variance += factor * correlation * sigma_i * sigma_j * C_i * C_j
+        variance += correlation * sigma_i * sigma_j * C_i * C_j
 
     plugin_reporting = {}
+    plugin_reporting["variance"]= variance
     plugin_reporting["standard_deviation"]= variance ** 0.5
 
 
