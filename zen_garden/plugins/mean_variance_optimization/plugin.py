@@ -17,6 +17,9 @@ config = {
 
 
 def _get_capex_specific(optimization_setup):
+    """
+    Reads all capex parameters from the optimization setup.
+    """
     capex_specific_conversion = optimization_setup.parameters.capex_specific_conversion
     capex_specific_conversion = capex_specific_conversion.rename(
         {'level_0': 'set_technologies',
@@ -53,7 +56,9 @@ def _get_capex_specific(optimization_setup):
     return capex_specific
 
 def _get_sd(optimization_setup):
-
+    """
+    Reads all sd values from file
+    """
     tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
     technologies = list(optimization_setup.sets["set_technologies"])
 
@@ -69,13 +74,14 @@ def _get_sd(optimization_setup):
 
 
 def _get_correlation(optimization_setup):
+    """
+    Reads all correlations from file and preprocess them
+    """
     tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
     technologies = list(optimization_setup.sets["set_technologies"])
     time_steps_yearly = optimization_setup.sets["set_time_steps_yearly"]
     nodes = list(optimization_setup.sets["set_nodes"])
     edges = list(optimization_setup.sets["set_edges"])
-    locations = nodes + edges
-    set_capacity_types = ["power", "energy"]
 
     correlation_df = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
     correlation_np = correlation_df.to_numpy()
@@ -124,146 +130,6 @@ def _get_correlation(optimization_setup):
 
     return full_corr
 
-def _spatial_and_time_correlation(optimization_setup, quadratic_term):
-    # Capacity additions
-    capacity_addition = optimization_setup.model.variables["capacity_addition"]
-
-    # Absolute standard deviation of capex
-    capex_specific_xr = _get_capex_specific(optimization_setup)
-    relative_sd_xr = _get_sd(optimization_setup)
-    absolute_sd_xr = (capex_specific_xr * relative_sd_xr).stack(
-        all_dims=["set_technologies", "set_location", "set_time_steps_yearly", "set_capacity_types"]
-    ).dropna("all_dims")
-    absolute_sd_dict = absolute_sd_xr.to_series().to_dict()
-
-    # Correlation matrix
-    valid_keys = set(absolute_sd_dict.keys())
-
-    corr_xr = _get_correlation(optimization_setup)
-    corr_series = corr_xr.to_series().dropna()
-    corr_series = corr_series[corr_series != 0]
-
-    # Build pairs DataFrame from valid_keys
-    valid_df = pd.DataFrame(list(valid_keys), columns=["tech", "loc", "time", "cap"])
-    pairs = valid_df.add_suffix("_i").merge(valid_df.add_suffix("_j"), how="cross")
-
-    # Merge with correlation values (loc/cap correlation = 1, so just look up tech×time)
-    pairs = pairs.merge(
-        corr_series.rename("correlation"),
-        left_on=["tech_i", "tech_j", "time_i", "time_j"],
-        right_index=True,
-        how="inner"
-    )
-
-    pair_dict = pairs.set_index(
-        ["tech_i", "tech_j", "time_i", "time_j", "loc_i", "loc_j", "cap_i", "cap_j"]
-    )["correlation"].to_dict()
-
-    #
-    # techs = list({k[0] for k in valid_keys})
-    # locs = list({k[1] for k in valid_keys})
-    # times = list({k[2] for k in valid_keys})
-    # caps = list({k[3] for k in valid_keys})
-    #
-    # corr_sub = corr_xr.sel(
-    #     set_technologies_i=techs,
-    #     set_technologies_j=techs,
-    #     set_time_steps_yearly_i=times,
-    #     set_time_steps_yearly_j=times,
-    #     set_locations_i=locs,
-    #     set_locations_j=locs,
-    #     set_capacity_types_i=caps,
-    #     set_capacity_types_j=caps,
-    # )
-    #
-    # stacked = corr_sub.stack(all_dims=list(corr_sub.dims)).dropna("all_dims")
-    # stacked = stacked.where(stacked != 0, drop=True)
-    #
-    # pair_dict = {
-    #     idx: float(val)
-    #     for idx, val in zip(stacked.indexes["all_dims"], stacked.values)
-    #     if (idx[0], idx[4], idx[2], idx[6]) in valid_keys  # key_i
-    #        and (idx[1], idx[5], idx[3], idx[7]) in valid_keys  # key_j
-    # }
-    #
-    # valid_keys_list = list(valid_keys)
-    #
-    # pair_dict = {}
-    # for key_i in tqdm(valid_keys_list, desc="Building pair_dict"):
-    #     tech_i, loc_i, time_i, cap_i = key_i
-    #     for key_j in valid_keys_list:
-    #         tech_j, loc_j, time_j, cap_j = key_j
-    #         value = float(corr_xr.sel(
-    #             set_technologies_i=tech_i,
-    #             set_technologies_j=tech_j,
-    #             set_time_steps_yearly_i=time_i,
-    #             set_time_steps_yearly_j=time_j,
-    #             set_locations_i=loc_i,
-    #             set_locations_j=loc_j,
-    #             set_capacity_types_i=cap_i,
-    #             set_capacity_types_j=cap_j,
-    #         ))
-    #         if np.isfinite(value) and value != 0:
-    #             pair_dict[(tech_i, tech_j, time_i, time_j, loc_i, loc_j, cap_i, cap_j)] = value
-
-    #
-    # stacked_corr = corr_xr.stack(all_dims=list(corr_xr.dims))
-    #
-    # pair_dict = {}
-    # for idx, value in zip(stacked_corr.indexes["all_dims"], stacked_corr.values):
-    #     if not np.isfinite(value) or value == 0:
-    #         continue
-    #     tech_i, tech_j, time_i, time_j, loc_i, loc_j, cap_i, cap_j = idx
-    #     key_i = (tech_i, loc_i, time_i, cap_i)
-    #     key_j = (tech_j, loc_j, time_j, cap_j)
-    #     if key_i in valid_keys and key_j in valid_keys:
-    #         pair_dict[idx] = value
-
-    #
-    # stacked = corr_xr.stack(all_dims=corr_xr.dims)
-    # valid_entries = absolute_sd_xr.notnull() & (absolute_sd_xr != 0)
-    # mask_i = valid_entries.sel(
-    #     set_technologies=stacked["set_technologies_i"],
-    #     set_location=stacked["set_locations_i"],
-    #     set_time_steps_yearly=stacked["set_time_steps_yearly_i"],
-    #     set_capacity_types=stacked["set_capacity_types_i"],
-    # )
-    #
-    # mask_j = valid_entries.sel(
-    #     set_technologies=stacked["set_technologies_j"],
-    #     set_location=stacked["set_locations_j"],
-    #     set_time_steps_yearly=stacked["set_time_steps_yearly_j"],
-    #     set_capacity_types=stacked["set_capacity_types_j"],
-    # )
-    #
-    # mask = mask_i & mask_j
-    # stacked_filtered = stacked.where(mask, drop=True)
-    #
-    # pair_dict = {
-    #     tuple(idx): value
-    #     for idx, value in zip(stacked_filtered.indexes["all_dims"], stacked_filtered.values)
-    #     if np.isfinite(value) and value != 0
-    # }
-    # len(pair_dict)
-
-    for tech_pair, correlation in tqdm(pair_dict.items(), total=len(pair_dict),
-                                       desc="Constructing quadratic variance term for technology capex"):
-        tech_i, tech_j, time_i, time_j, loc_i, loc_j, cap_i, cap_j = tech_pair
-
-        absolute_sd_1 = absolute_sd_dict[(tech_i, loc_i, time_i, cap_i)]
-        absolute_sd_2 = absolute_sd_dict[(tech_j, loc_j, time_j, cap_j)]
-
-        capacity_addition_1 = capacity_addition.sel(
-            set_technologies=tech_i, set_time_steps_yearly=time_i,
-            set_location=loc_i, set_capacity_types=cap_i)
-        capacity_addition_2 = capacity_addition.sel(
-            set_technologies=tech_j, set_time_steps_yearly=time_j,
-            set_location=loc_j, set_capacity_types=cap_j)
-
-        quadratic_term += correlation * absolute_sd_1 * absolute_sd_2 * capacity_addition_1 * capacity_addition_2
-
-    return quadratic_term
-
 def _only_technology_correlation(optimization_setup, quadratic_term):
     """Simplified variance term: aggregate capacity additions over locations and time steps,
     and compute correlations only per technology pair (not per location/time).
@@ -276,9 +142,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     model = optimization_setup.model
     capacity_addition = model.variables["capacity_addition"]
 
-    # ------------------------------------------------------------------ #
-    # 1. New variable:  C_agg[tech, cap] ≥ 0                            #
-    # ------------------------------------------------------------------ #
+    # Create a new variable for the aggregated capacity addition per technology and capacity type
     technologies = list(optimization_setup.sets["set_technologies"])
     set_capacity_types = ["power", "energy"]
 
@@ -294,9 +158,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
             name="capacity_addition_tech_agg",
         )
 
-    # ------------------------------------------------------------------ #
-    # 2. Constraint:  C_agg[tech, cap] == Σ_{loc,t} capacity_addition   #
-    # ------------------------------------------------------------------ #
+    # Create constraint aggregating technology capacities over locations and investment periods
     if "constraint_capacity_addition_tech_agg" not in model.constraints:
         capacity_addition_agg_expr = capacity_addition.sum(["set_location", "set_time_steps_yearly"])
         model.add_constraints(
@@ -304,9 +166,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
             name="constraint_capacity_addition_tech_agg",
         )
 
-    # ------------------------------------------------------------------ #
-    # 3. σ per (tech, cap_type): mean of absolute SD over loc / time    #
-    # ------------------------------------------------------------------ #
+    # Calculate absolute SD per technology
     capex_specific_xr = _get_capex_specific(optimization_setup)
     relative_sd_xr = _get_sd(optimization_setup)
     absolute_sd_xr = (capex_specific_xr * relative_sd_xr).stack(
@@ -320,9 +180,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     )
     absolute_sd_per_tech = absolute_sd_per_tech[absolute_sd_per_tech != 0]
 
-    # ------------------------------------------------------------------ #
-    # 4. Technology-pair correlation (averaged over time steps)          #
-    # ------------------------------------------------------------------ #
+    # Calculate correlation per technology
     corr_xr = _get_correlation(optimization_setup)
     corr_series = (
         corr_xr.to_series()
@@ -334,23 +192,14 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     corr_df = corr_series.reset_index()
     corr_df.columns = ["tech_i", "tech_j", "correlation"]
 
-    # ------------------------------------------------------------------ #
-    # 5. Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation #
-    # ------------------------------------------------------------------ #
+    # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation #
     valid_tech_cap = set(absolute_sd_per_tech.index)
     valid_df = pd.DataFrame(list(valid_tech_cap), columns=["tech", "cap"])
     pairs = valid_df.add_suffix("_i").merge(valid_df.add_suffix("_j"), how="cross")
     pairs = pairs.merge(corr_df, on=["tech_i", "tech_j"], how="inner")
-    # pairs.loc[(pairs["tech_i"] == pairs["tech_j"]) & (pairs["cap_i"] != pairs["cap_j"]),"correlation"] = 0.98
-    pairs.to_excel("Correlation.xlsx")
-    absolute_sd_per_tech.to_excel("Absolute_SD.xlsx")
     weighting_factor = config.get("weighting_factor")
 
-    # ------------------------------------------------------------------ #
-    # 6. Quadratic term using the auxiliary variable                     #
-    # ------------------------------------------------------------------ #
-    log_rows = []
-
+    # Quadratic term using the auxiliary variable                     #
     for _, row in tqdm(pairs.iterrows(), total=len(pairs),
                        desc="Constructing quadratic variance term (technology-only correlation)"):
         tech_i, cap_i = row["tech_i"], row["cap_i"]
@@ -366,25 +215,6 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
         scalar_coeff = weighting_factor * correlation * sigma_i * sigma_j
         quadratic_term += scalar_coeff * C_i * C_j
 
-        log_rows.append({
-            "tech_i": tech_i,
-            "cap_i": cap_i,
-            "tech_j": tech_j,
-            "cap_j": cap_j,
-            "correlation": correlation,
-            "sigma_i": sigma_i,
-            "sigma_j": sigma_j,
-            "weighting_factor": weighting_factor,
-            "scalar_coeff (wf*corr*sigma_i*sigma_j)": scalar_coeff,
-            "C_i_var": f"capacity_addition_tech_agg[{tech_i}, {cap_i}]",
-            "C_j_var": f"capacity_addition_tech_agg[{tech_j}, {cap_j}]",
-        })
-
-    log_df = pd.DataFrame(log_rows)
-    log_path = Path("quadratic_term_log.csv")
-    log_df.to_csv(log_path, index=False)
-    logging.getLogger(__name__).info(f"Quadratic term log written to {log_path.resolve()}")
-
     return quadratic_term
 
 @EventPublisher.register(Event.after_model_construction)
@@ -399,8 +229,7 @@ def construct_mean_variance_objective(optimization_setup=None):
 
 
     optimization_setup.model.remove_objective()
-    # rule = VarianceRules(optimization_setup)
-    # objective = rule.constraint_variance_term()
+
     npv_term = optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
 
     objective = quadratic_term + npv_term
