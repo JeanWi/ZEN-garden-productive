@@ -1,3 +1,5 @@
+from copyreg import add_extension
+
 import pandas as pd
 from datetime import datetime
 from preprocessing.helpers import check_for_semidefinite
@@ -18,7 +20,7 @@ on_server = False
 example_dataset = True
 base = 10e-9
 weights = [x * base for x in [25, 50, 75, 100]]
-
+dir_extension = "single_period"
 
 # PATHS
 if on_server:
@@ -43,7 +45,7 @@ else:
 
 now = datetime.now()
 time_str = now.strftime("%Y%m%d-%H%M%S")
-result_folder = f"./outputs_{time_str}/linear"
+result_folder = f"./outputs_{time_str}_{dir_extension}/linear"
 if not os.path.exists(result_folder):
     os.makedirs(result_folder)
 
