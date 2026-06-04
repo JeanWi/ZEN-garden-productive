@@ -14,8 +14,8 @@ from zen_garden.plugins.mean_variance_optimization.plugin import config as plugi
 
 
 # SETTINGS
-on_server = True
-example_dataset = False
+on_server = False
+example_dataset = True
 base = 10e-9
 weights = [x * base for x in [25, 50, 75, 100]]
 
