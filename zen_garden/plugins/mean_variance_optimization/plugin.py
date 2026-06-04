@@ -124,7 +124,16 @@ def calculate_variance_from_solution(postprocessing=None):
     plugin_reporting["standard_deviation"]= variance ** 0.5
 
 
-    postprocessing.write_file(postprocessing.name_dir.joinpath("mean_variance_dict"), plugin_reporting, mode="w", format = "json")
+    model = postprocessing.optimization_setup.model
+    objective_value = float(model.objective.value)
+    npv_value = float(model.variables["net_present_cost"].solution.sum("set_time_steps_yearly"))
+
+    plugin_reporting["objective_value"] = objective_value
+    plugin_reporting["npv"] = npv_value
+    plugin_reporting["weighting_factor"] = config.get("weighting_factor")
+
+    postprocessing.write_file(postprocessing.name_dir.joinpath("mean_variance_dict"), plugin_reporting, mode="w", format="json")
+
 
 
 @EventPublisher.register(Event.after_model_construction)
