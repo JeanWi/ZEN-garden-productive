@@ -1,5 +1,7 @@
 import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
+import os
 
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.plugins.mean_variance_optimization.helpers import calculate_absolute_sd, calculate_correlation_matrix, \
@@ -59,7 +61,8 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     # Get weighting factor
     weighting_factor = config.get("weighting_factor")
 
-    # Quadratic term using the auxiliary variable                     #
+    # Quadratic term using the auxiliary variable
+    covariance_rows = []
     for _, row in tqdm(pairs.iterrows(), total=len(pairs),
                        desc="Constructing quadratic variance term (technology-only correlation)"):
         tech_i, cap_i = row["tech_i"], row["cap_i"]
@@ -74,6 +77,19 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
 
         scalar_coeff = weighting_factor * correlation * sigma_i * sigma_j
         quadratic_term += scalar_coeff * C_i * C_j
+
+        covariance_rows.append({
+            "tech_i": tech_i,
+            "cap_i": cap_i,
+            "tech_j": tech_j,
+            "cap_j": cap_j,
+            "covariance": correlation * sigma_i * sigma_j,
+        })
+
+    dir = Path(optimization_setup.analysis.folder_output).joinpath(os.path.basename(optimization_setup.analysis.dataset))
+    pd.DataFrame(covariance_rows).to_csv(
+        dir / "covariance_pairs_objective_construction.csv", index=False
+    )
 
     return quadratic_term
 
@@ -106,6 +122,7 @@ def calculate_variance_from_solution(postprocessing=None):
     )
 
     variance = 0.0
+    covariance_rows = []
     for _, row in pairs.iterrows():
         tech_i, cap_i = row["tech_i"], row["cap_i"]
         tech_j, cap_j = row["tech_j"], row["cap_j"]
@@ -118,6 +135,14 @@ def calculate_variance_from_solution(postprocessing=None):
         C_j = float(capacity_addition_sol.sel(set_technologies=tech_j, set_capacity_types=cap_j))
 
         variance += correlation * sigma_i * sigma_j * C_i * C_j
+
+        covariance_rows.append({
+            "tech_i": row["tech_i"],
+            "cap_i": row["cap_i"],
+            "tech_j": row["tech_j"],
+            "cap_j": row["cap_j"],
+            "covariance": row["correlation"] * sigma_i * sigma_j,
+        })
 
     plugin_reporting = {}
     plugin_reporting["variance"]= variance
@@ -133,6 +158,9 @@ def calculate_variance_from_solution(postprocessing=None):
     plugin_reporting["weighting_factor"] = config.get("weighting_factor")
 
     postprocessing.write_file(postprocessing.name_dir.joinpath("mean_variance_dict"), plugin_reporting, mode="w", format="json")
+    pd.DataFrame(covariance_rows).to_csv(
+        postprocessing.name_dir / "covariance_pairs_reporting.csv", index=False
+    )
 
 
 

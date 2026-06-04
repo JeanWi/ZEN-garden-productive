@@ -70,7 +70,7 @@ for variance_inclusion in include_var_for.keys():
 
     for i, weight in enumerate(weights):
         if i == 0:
-            result_folder = f"./outputs_{time_str}/{variance_inclusion}/lambda_{str(weight)}"
+            result_folder = f"./outputs_{time_str}_{dir_extension}/{variance_inclusion}/lambda_{str(weight)}"
 
             if not os.path.exists(result_folder):
                 os.makedirs(result_folder)
