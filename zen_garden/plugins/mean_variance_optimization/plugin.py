@@ -178,6 +178,7 @@ def construct_mean_variance_objective(optimization_setup=None):
     npv_term = optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
 
     weighting_factor = config.get("weighting_factor")
+    if weighting_factor is None: weighting_factor = 0
 
     objective = weighting_factor * quadratic_term + npv_term
     sense = "min"
