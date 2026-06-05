@@ -66,37 +66,37 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
 
     # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
     pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
+    #
+    # # Quadratic term using the auxiliary variable
+    # covariance_rows = []
+    # capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
+    # for _, row in tqdm(pairs.iterrows(), total=len(pairs),
+    #                    desc="Constructing quadratic variance term (technology-only correlation)"):
+    #     tech_i, cap_i = row["tech_i"], row["cap_i"]
+    #     tech_j, cap_j = row["tech_j"], row["cap_j"]
+    #     correlation = row["correlation"]
+    #
+    #     sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
+    #     sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
+    #
+    #     C_i = capacity_addition_tech_agg.sel(set_technologies=tech_i, set_capacity_types=cap_i)
+    #     C_j = capacity_addition_tech_agg.sel(set_technologies=tech_j, set_capacity_types=cap_j)
+    #
+    #     scalar_coeff = correlation * sigma_i * sigma_j
+    #     quadratic_term += scalar_coeff * C_i * C_j
+    #
+    #     covariance_rows.append({
+    #         "tech_i": tech_i,
+    #         "cap_i": cap_i,
+    #         "tech_j": tech_j,
+    #         "cap_j": cap_j,
+    #         "covariance": correlation * sigma_i * sigma_j,
+    #     })
 
-    # Quadratic term using the auxiliary variable
-    covariance_rows = []
-    capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
-    for _, row in tqdm(pairs.iterrows(), total=len(pairs),
-                       desc="Constructing quadratic variance term (technology-only correlation)"):
-        tech_i, cap_i = row["tech_i"], row["cap_i"]
-        tech_j, cap_j = row["tech_j"], row["cap_j"]
-        correlation = row["correlation"]
-
-        sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
-        sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
-
-        C_i = capacity_addition_tech_agg.sel(set_technologies=tech_i, set_capacity_types=cap_i)
-        C_j = capacity_addition_tech_agg.sel(set_technologies=tech_j, set_capacity_types=cap_j)
-
-        scalar_coeff = correlation * sigma_i * sigma_j
-        quadratic_term += scalar_coeff * C_i * C_j
-
-        covariance_rows.append({
-            "tech_i": tech_i,
-            "cap_i": cap_i,
-            "tech_j": tech_j,
-            "cap_j": cap_j,
-            "covariance": correlation * sigma_i * sigma_j,
-        })
-
-    dir = Path(optimization_setup.analysis.folder_output).joinpath(os.path.basename(optimization_setup.analysis.dataset))
-    pd.DataFrame(covariance_rows).to_csv(
-        dir / "covariance_pairs_objective_construction.csv", index=False
-    )
+    # dir = Path(optimization_setup.analysis.folder_output).joinpath(os.path.basename(optimization_setup.analysis.dataset))
+    # pd.DataFrame(covariance_rows).to_csv(
+    #     dir / "covariance_pairs_objective_construction.csv", index=False
+    # )
 
     return quadratic_term
 

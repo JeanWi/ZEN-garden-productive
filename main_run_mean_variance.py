@@ -17,10 +17,10 @@ from zen_garden.plugins.mean_variance_optimization.plugin import config as plugi
 
 # SETTINGS
 on_server = False
-example_dataset = True
-base = 10e-3
-weights = [x * base for x in [1]]
-dir_extension = "single_period_fixed_aggregation_of_capacity_var"
+example_dataset = False
+base = 10e-6
+weights = [x * base for x in [25, 50, 75, 100]]
+dir_extension = "single_period_updated_variable_aggregation"
 
 # PATHS
 if on_server:
