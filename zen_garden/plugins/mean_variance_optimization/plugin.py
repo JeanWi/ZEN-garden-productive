@@ -58,9 +58,6 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
     pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
 
-    # Get weighting factor
-    weighting_factor = config.get("weighting_factor")
-
     # Quadratic term using the auxiliary variable
     covariance_rows = []
     for _, row in tqdm(pairs.iterrows(), total=len(pairs),
@@ -75,7 +72,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
         C_i = capacity_addition_tech_agg.sel(set_technologies=tech_i, set_capacity_types=cap_i)
         C_j = capacity_addition_tech_agg.sel(set_technologies=tech_j, set_capacity_types=cap_j)
 
-        scalar_coeff = weighting_factor * correlation * sigma_i * sigma_j
+        scalar_coeff = correlation * sigma_i * sigma_j
         quadratic_term += scalar_coeff * C_i * C_j
 
         covariance_rows.append({
@@ -180,7 +177,9 @@ def construct_mean_variance_objective(optimization_setup=None):
 
     npv_term = optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
 
-    objective = quadratic_term + npv_term
+    weighting_factor = config.get("weighting_factor")
+
+    objective = weighting_factor * quadratic_term + npv_term
     sense = "min"
     optimization_setup.model.add_objective(objective, sense=sense)
 
