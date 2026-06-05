@@ -63,15 +63,15 @@ def _get_sd(optimization_setup):
     return sd_xr
 
 
-def _get_correlation(optimization_setup):
+def _get_correlation(optimization_setup, no_correlation=False):
     """
-    Reads all correlations from file and preprocess them
+    Reads all correlations from file and preprocess them.
+    
+    If no_correlation=True, returns identity correlation matrix (diagonal=1, off-diagonal=0).
     """
     tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
     technologies = list(optimization_setup.sets["set_technologies"])
     time_steps_yearly = optimization_setup.sets["set_time_steps_yearly"]
-    nodes = list(optimization_setup.sets["set_nodes"])
-    edges = list(optimization_setup.sets["set_edges"])
 
     correlation_df = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
     correlation_np = correlation_df.to_numpy()
@@ -118,6 +118,19 @@ def _get_correlation(optimization_setup):
             * time_corr.rename(set_technologies="set_technologies_i")
     )
 
+    if no_correlation:
+        # Return identity correlation matrix: diagonal = 1, off-diagonal = 0
+        n_techs = len(technologies)
+        identity_corr = np.eye(n_techs)
+        full_corr = xr.DataArray(
+            identity_corr,
+            dims=("set_technologies_i", "set_technologies_j"),
+            coords={
+                "set_technologies_i": technologies,
+                "set_technologies_j": technologies,
+            },
+        )
+
     return full_corr
 
 
@@ -129,8 +142,8 @@ def generate_covariance_pairs(absolute_sd_per_tech, corr_df):
     return pairs
 
 
-def calculate_correlation_matrix(optimization_setup):
-    corr_xr = _get_correlation(optimization_setup)
+def calculate_correlation_matrix(optimization_setup, no_correlation=False):
+    corr_xr = _get_correlation(optimization_setup, no_correlation=no_correlation)
     corr_series = (
         corr_xr.to_series()
         .groupby(level=["set_technologies_i", "set_technologies_j"])

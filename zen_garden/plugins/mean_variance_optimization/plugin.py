@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
@@ -6,6 +7,8 @@ import os
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.plugins.mean_variance_optimization.helpers import calculate_absolute_sd, calculate_correlation_matrix, \
     generate_covariance_pairs
+
+from zen_garden.model.element import Element
 
 config = {
     "weighting_factor": None,
@@ -23,31 +26,37 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     built from products of these scalar variables, which linopy can handle as a proper QP.
     """
     model = optimization_setup.model
-    capacity_addition = model.variables["capacity_addition"]
 
-    # Create a new variable for the aggregated capacity addition per technology and capacity type
-    technologies = list(optimization_setup.sets["set_technologies"])
-    set_capacity_types = ["power", "energy"]
+    if "capacity_addition_tech_agg" not in model.variables:
+        variables = optimization_setup.variables
 
-    if "capacity_addition_tech_agg" in model.variables:
-        capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
-    else:
-        capacity_addition_tech_agg = model.add_variables(
-            lower=0,
-            coords=[
-                pd.Index(technologies, name="set_technologies"),
-                pd.Index(set_capacity_types, name="set_capacity_types"),
-            ],
+        variables.add_variable(
+            model,
             name="capacity_addition_tech_agg",
+            index_sets=Element.create_custom_set(
+                [
+                    "set_technologies",
+                    "set_capacity_types"
+                ],
+                optimization_setup,
+            ),
+            bounds=(0, np.inf),
+            doc="size of installed technology at location l and time t",
+            unit_category={"energy_quantity": 1, "time": -1},
         )
+
 
     # Create constraint aggregating technology capacities over locations and investment periods
     if "constraint_capacity_addition_tech_agg" not in model.constraints:
-        capacity_addition_agg_expr = capacity_addition.sum(["set_location", "set_time_steps_yearly"])
-        model.add_constraints(
-            capacity_addition_tech_agg - capacity_addition_agg_expr == 0,
-            name="constraint_capacity_addition_tech_agg",
+        lhs_exp = model.variables["capacity_addition_tech_agg"]
+        rhs_exp = model.variables["capacity_addition"].sum(["set_location", "set_time_steps_yearly"])
+        constraint_capacity_addition = lhs_exp == rhs_exp
+
+
+        optimization_setup.constraints.add_constraint(
+            "constraint_capacity_addition_tech_agg", constraint_capacity_addition
         )
+
 
     # Absolute SD per technology
     absolute_sd_per_tech = calculate_absolute_sd(optimization_setup)
@@ -60,6 +69,7 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
 
     # Quadratic term using the auxiliary variable
     covariance_rows = []
+    capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
     for _, row in tqdm(pairs.iterrows(), total=len(pairs),
                        desc="Constructing quadratic variance term (technology-only correlation)"):
         tech_i, cap_i = row["tech_i"], row["cap_i"]
