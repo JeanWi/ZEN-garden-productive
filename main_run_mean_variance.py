@@ -18,9 +18,9 @@ from zen_garden.plugins.mean_variance_optimization.plugin import config as plugi
 # SETTINGS
 on_server = False
 example_dataset = True
-base = 10e-9
-weights = [x * base for x in [25, 50, 75, 100]]
-dir_extension = "single_period"
+base = 10e-3
+weights = [x * base for x in [1]]
+dir_extension = "single_period_weight_factor_moved"
 
 # PATHS
 if on_server:
