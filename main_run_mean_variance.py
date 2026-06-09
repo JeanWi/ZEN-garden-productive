@@ -20,7 +20,7 @@ on_server = False
 example_dataset = False
 base = 10e-6
 weights = [x * base for x in [25, 50, 75, 100]]
-dir_extension = "single_period_updated_variable_aggregation"
+dir_extension = "good_run_1periods"
 
 # PATHS
 if on_server:
