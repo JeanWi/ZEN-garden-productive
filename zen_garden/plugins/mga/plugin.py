@@ -67,7 +67,6 @@ Configuration (via the "plugins.mga" block in config.json):
         Solver is hardcoded to Gurobi.
 """
 
-import hashlib
 import json
 import logging
 import time
@@ -144,6 +143,18 @@ class MGA:
         self.optimization_setup = optimization_setup
         self.model = optimization_setup.model
         self.cap_add = self.model.variables["capacity_addition"]
+        # Capacity-type selection mask (storage fix): capacity_addition spans
+        # set_capacity_types. Storage techs carry two incommensurable types
+        # (power [GW] + energy [GWh]); every other tech carries only power.
+        # Summing both for storage is meaningless, so build a 0/1 coefficient
+        # mask over (set_technologies, set_capacity_types) that keeps, per tech,
+        # the energy type for storage (multi-type) techs and the single (power)
+        # type otherwise. Applied wherever an axis aggregates cap_add over
+        # set_capacity_types, so the fmax LP, baseline z*, projection equality,
+        # and z-extraction all agree.
+        self._cap_keep, self._power_cap_type, self._energy_cap_types = (
+            self._build_capacity_keep_mask()
+        )
         if epsilon <= 0:
             raise ValueError(f"MGA epsilon must be positive, got {epsilon!r}")
         self.epsilon = epsilon
@@ -387,6 +398,42 @@ class MGA:
             if axis_kind[name] == "tech_capacity"
         )
 
+        # --- Storage fix: per-tech-axis capacity-type homogeneity ---------
+        # After the capacity-type mask, each tech axis aggregates ONE capacity
+        # quantity per member: energy for storage techs, power otherwise. A
+        # lumped tech axis mixing storage (energy/GWh) with non-storage
+        # (power/GW) members would re-introduce unit mixing, so require every
+        # member of a tech axis to share the same selected capacity type(s),
+        # and record that type per axis (for the polytope metadata).
+        self._axis_capacity_type: dict[str, str] = {}
+        for name, members in z_groups:
+            if axis_kind[name] != "tech_capacity":
+                continue
+            sigs = {
+                m: tuple(
+                    str(c)
+                    for c in self._cap_keep.coords["set_capacity_types"].values
+                    if float(self._cap_keep.sel(set_technologies=m,
+                                                set_capacity_types=c)) > 0.5
+                )
+                for m in members
+            }
+            distinct = set(sigs.values())
+            if len(distinct) > 1:
+                raise ValueError(
+                    f"MGA tech axis {name!r}: members map to different capacity "
+                    f"types {sigs}. Lumping storage (energy) with non-storage "
+                    f"(power) techs mixes incommensurable units (GWh vs GW); "
+                    f"split them into separate axes."
+                )
+            sig = next(iter(distinct))
+            if not sig:
+                raise RuntimeError(
+                    f"MGA tech axis {name!r}: no active capacity type for "
+                    f"members {members}; cannot form an axis."
+                )
+            self._axis_capacity_type[name] = "+".join(sig)
+
         # Model handles for carrier-import axes (looked up once).
         if self.has_carrier_axis:
             self.flow_import = self.model.variables["flow_import"]
@@ -499,12 +546,58 @@ class MGA:
     _TECH_AGG = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
     _CARRIER_AGG = ["set_carriers", "set_nodes", "set_time_steps_operation"]
 
+    def _build_capacity_keep_mask(self):
+        """0/1 coefficient mask over (set_technologies, set_capacity_types).
+
+        For each technology, keep only the capacity types that form a
+        well-posed axis quantity: storage technologies (those with MORE THAN ONE
+        capacity type in the model) keep ONLY their energy capacity and drop
+        power; every other technology keeps its single (power) type. Detected
+        from the live capacity_addition variable (``labels != -1`` marks an
+        active (tech, capacity_type) entry, see linopy), so no technology list is
+        hardcoded. ``power`` is ``system.set_capacity_types[0]`` — ZEN-garden's
+        own convention for the single type assigned to non-storage techs (see
+        ``Element.handle_set_capacity_types_index``); the energy type(s) are the
+        remaining ones. Returns (mask: DataArray float, power_type: str,
+        energy_types: list[str]).
+        """
+        ct_dim = "set_capacity_types"
+        extra = [d for d in self.cap_add.dims if d not in ("set_technologies", ct_dim)]
+        # active[tech, captype] == an actual variable exists for some (loc, year)
+        active = (self.cap_add.labels != -1).any(extra)
+        cap_types = [str(c) for c in self.cap_add.coords[ct_dim].values]
+        power_ct = str(self.optimization_setup.system.set_capacity_types[0])
+        if power_ct not in cap_types:
+            raise RuntimeError(
+                f"MGA storage fix: power capacity type {power_ct!r} "
+                f"(system.set_capacity_types[0]) is not among capacity_addition's "
+                f"capacity types {cap_types}."
+            )
+        energy_types = [c for c in cap_types if c != power_ct]
+        n_active = active.sum(ct_dim)            # per tech: 1 (power only) or >1 (storage)
+        is_power = active[ct_dim] == power_ct    # along set_capacity_types
+        multi = n_active > 1                     # storage techs
+        # Keep every active entry EXCEPT the power entry of multi-type techs.
+        keep = active & ~(multi & is_power)
+        multi_techs = [
+            str(t) for t in active["set_technologies"].values
+            if bool(multi.sel(set_technologies=t))
+        ]
+        logging.info(
+            f"MGA storage fix: power capacity type = {power_ct!r}, energy "
+            f"capacity type(s) = {energy_types}; {len(multi_techs)} multi-"
+            f"capacity-type (storage) tech(s) will use ENERGY only: {multi_techs}."
+        )
+        return keep.astype(float), power_ct, energy_types
+
     def _axis_linexpr(self, name: str):
         """linopy LinearExpression for one axis (fmax LP objective / projection).
 
         Branches on axis kind (the ONLY place, besides _axis_value, that does):
           tech_capacity  -> sum of capacity_addition over the axis's member
-                            techs and over (cap_type, loc, year).
+                            techs and over (cap_type, loc, year), restricted by
+                            _cap_keep to the selected capacity type per tech
+                            (energy for storage techs, power otherwise).
           carrier_import -> duration-weighted sum of flow_import over the axis's
                             member carriers, nodes, and operational time steps:
                             sum_{m,n,t} tau_t * flow_import[m, n, t].
@@ -512,7 +605,8 @@ class MGA:
         members = self._members_by_name[name]
         if self.axis_kind[name] == "tech_capacity":
             return (
-                self.cap_add.sel(set_technologies=members)
+                (self._cap_keep * self.cap_add)
+                .sel(set_technologies=members)
                 .sum(self._TECH_AGG + ["set_technologies"])
             )
         # carrier_import
@@ -530,7 +624,7 @@ class MGA:
         members = self._members_by_name[name]
         if self.axis_kind[name] == "tech_capacity":
             return float(
-                self.cap_add.solution
+                (self._cap_keep * self.cap_add.solution)
                 .sel(set_technologies=members)
                 .sum(self._TECH_AGG + ["set_technologies"])
             )
@@ -584,186 +678,143 @@ class MGA:
         """
         return self._to_explore_coords(self._z_star_design_raw, self.c_star)
 
-    def _compute_dataset_hash(self) -> str:
-        """SHA-256-prefix digest of the dataset folder's contents.
+    @staticmethod
+    def _find_level(index, needle: str):
+        """Name of the first index level containing `needle` (e.g. 'technolog',
+        'capacity_type', 'carrier'), or None."""
+        return next((lvl for lvl in index.names if needle in lvl), None)
 
-        Used to invalidate the fmax cache when the input data has changed.
-        Walks the dataset folder recursively in sorted relative-path order,
-        feeding both filenames and file contents into the digest, and skips
-        dotfiles (e.g. macOS `.DS_Store`). Truncated to 16 hex chars; the
-        2^-64 collision probability is fine for a workflow-internal sanity
-        check.
+    def _axis_physical_unit(self, name: str):
+        """Original physical unit string of the axis VALUE, read from the model's
+        unit handling (the dataset-derived units; same source as var_dict.h5's
+        *_units). Returns None when unit tracking is off
+        (solver.check_unit_consistency=False) or the unit is unavailable.
 
-        NOTE: this only catches changes to files INSIDE the dataset folder.
-        Edits to `config.json`, the zen-garden source code, or solver
-        options will silently NOT invalidate the cache — out of scope.
+          tech axis    -> capacity_addition unit at the axis's selected capacity
+                          type. ZEN-garden already annualises the energy capacity
+                          type to "<power unit> * hour" (e.g. gigawatt * hour for
+                          battery), so it is read as-is.
+          carrier axis -> flow_import is an instantaneous (power) unit, but the
+                          axis is the duration-weighted ANNUAL import, so the
+                          stored value's unit is "<flow unit> * hour" (energy).
+
+        Heterogeneous lumps (members with differing units) yield a ' + '-joined
+        string instead of a single unit.
         """
-        root = Path(self.optimization_setup.analysis.dataset).resolve()
-        h = hashlib.sha256()
-        for path in sorted(
-            p for p in root.rglob("*")
-            if p.is_file() and not any(
-                part.startswith(".") for part in p.relative_to(root).parts
+        units = self.optimization_setup.variables.units
+        if self.axis_kind[name] == "tech_capacity":
+            ser = units.get("capacity_addition")
+            if ser is None:
+                return None
+            members = self._members_by_name[name]
+            selected = self._axis_capacity_type[name].split("+")
+            tech_lvl = self._find_level(ser.index, "technolog")
+            ct_lvl = self._find_level(ser.index, "capacity_type")
+            if tech_lvl is None or ct_lvl is None:
+                return None
+            mask = (
+                ser.index.get_level_values(tech_lvl).isin(members)
+                & ser.index.get_level_values(ct_lvl).isin(selected)
             )
-        ):
-            h.update(str(path.relative_to(root)).encode())
-            h.update(path.read_bytes())
-        return h.hexdigest()[:16]
+            vals = sorted({str(u) for u in ser[mask].to_numpy()})
+            return " + ".join(vals) if vals else None
+        # carrier_import: annualise the instantaneous flow unit (× hour).
+        ser = units.get("flow_import")
+        if ser is None:
+            return None
+        members = self._members_by_name[name]
+        carrier_lvl = self._find_level(ser.index, "carrier")
+        if carrier_lvl is None:
+            return None
+        mask = ser.index.get_level_values(carrier_lvl).isin(members)
+        ureg = self.optimization_setup.energy_system.unit_handling.ureg
+        annual = set()
+        for u in {str(x) for x in ser[mask].to_numpy()}:
+            try:
+                annual.add(str(ureg(f"({u}) * hour").units))
+            except Exception:
+                annual.add(f"({u}) * hour")
+        return " + ".join(sorted(annual)) if annual else None
+
+    def _cost_physical_unit(self):
+        """Physical unit of net_present_cost (e.g. 'megaEuro'), or None."""
+        ser = self.optimization_setup.variables.units.get("net_present_cost")
+        if ser is None:
+            return None
+        vals = sorted({str(u) for u in np.atleast_1d(np.asarray(ser))})
+        return " + ".join(vals) if vals else None
+
+    def polytope_metadata(self) -> dict:
+        """Self-describing metadata for the saved polytope.
+
+        Everything a consumer needs to de-normalise and interpret polytope.npz
+        WITHOUT the (now removed) fmax cache or config.json. The polytope's
+        normalisation convention is fixed: design axis i is z_i / U_i*, and the
+        cost axis (when present) is (C - C*) / (eps * C*). Hence u_tilde/offset
+        are NOT stored — they are an exact repackaging of (u_star, c_star,
+        epsilon) plus the cost-axis marker:
+            u_tilde = [u_star..., eps*C*],  offset = [0..., C*]
+        carrying no extra information.
+
+        Per design axis (z_names order): kind ("tech_capacity"/"carrier_import"),
+        members (the lumped composition), for tech axes the selected
+        capacity_type (e.g. "energy" for storage, "power" otherwise; null for
+        carrier axes), and the original physical `unit` string of the axis value
+        read from the dataset/model (null if unit tracking is disabled). The
+        cost axis carries its unit in `cost_unit`.
+        """
+        axes = []
+        for name in self.z_names:
+            kind = self.axis_kind[name]
+            axes.append({
+                "name": name,
+                "kind": kind,
+                "members": list(self._members_by_name[name]),
+                "capacity_type": (
+                    self._axis_capacity_type.get(name)
+                    if kind == "tech_capacity" else None
+                ),
+                "unit": self._axis_physical_unit(name),
+            })
+        return {
+            "axes": axes,
+            "cost_axis": "net_present_cost" if self.include_cost else None,
+            "cost_unit": self._cost_physical_unit() if self.include_cost else None,
+            "include_cost": bool(self.include_cost),
+            "normalisation": (
+                "design axis i: z_i / u_star[i]; "
+                "cost axis (if present): (C - c_star) / (epsilon * c_star)"
+            ),
+        }
 
     def compute_fmax_normalization(self) -> None:
         """Compute U_g* = max z_g over the near-optimal polytope, per z-axis.
 
         Solves one LP per axis: same model state as the baseline, plus the
         near-optimality cost cap (already added by setup()), with the objective
-        replaced by max(axis value) (kind-aware, see _axis_linexpr). U_g*
-        serves dually as (a) the per-axis upper bound of the initial outer
+        replaced by max(axis value) (kind-aware, see _axis_linexpr). U_g* serves
+        dually as (a) the per-axis upper bound of the initial outer
         approximation and (b) the normalisation denominator z_g / U_g*.
 
-        Cache file layout (JSON):
-            {"dataset_hash": "<sha256-prefix>",
-             "entries": {
-                 "<axis_name>": {"members": [<sorted tech names>],
-                                 "U_star":   <float>},
-                 ...
-             }}
-        ``dataset_hash`` is the digest of the dataset folder's contents (see
-        _compute_dataset_hash); if it changes, the entire cache is discarded
-        because every U_g* may now be wrong. ``members`` is the membership
-        the LP was solved against; if a current axis's sorted members differ
-        from the cached entry, that one axis is recomputed.
+        Every LP is solved on every run — there is NO caching. The n_z LPs are a
+        small fraction of total runtime, and always solving removes a whole
+        class of silent cache-staleness errors. Each LP's FULL solution (the
+        per-axis extreme near-optimal design) is persisted via Postprocess,
+        labelled ``<model_name>_fmax_<axis>`` — the same machinery the
+        per-iteration ORACLE solves use.
 
-        Legacy cache files written before this change (flat
-        ``{tech_name: U_star_float}``) are read transparently — each entry
-        is treated as a singleton with implicit ``members=[tech_name]``, no
-        dataset-hash check — and rewritten in the new format on save.
-
-        Sets self.u_star, self._u_tilde, self._offset. Call once, after
-        setup() and before setup_projection_model().
+        Sets self.u_star, self._u_tilde, self._offset. Call once, after setup()
+        and before setup_projection_model().
         """
-        dataset_name = Path(self.optimization_setup.analysis.dataset).name
-        # Cache lives next to the run output folders, as a sibling of
-        # folder_output (e.g. outputs/oracle_cache/). Deriving it from
-        # folder_output keeps it (a) shared across every run writing into the
-        # same outputs/ directory and (b) portable across machines — no
-        # hardcoded absolute path.
-        cache_dir = (
-            Path(self.optimization_setup.analysis.folder_output).parent
-            / "oracle_cache"
-            / dataset_name
-        )
-        cache_file = cache_dir / f"fmax_eps{self.epsilon}.json"
-
-        # --- Dataset content hash (integrity check; catches dataset edits) ---
-        current_hash = self._compute_dataset_hash()
-
-        # --- Load cache, detecting new vs legacy format ---
-        # cached_entries: axis_name -> {"members": sorted list[str], "U_star": float}
-        cached_entries: dict[str, dict] = {}
-        cache_was_legacy = False
-        if cache_file.exists():
-            with open(cache_file) as f:
-                raw_cache = json.load(f)
-            is_new_format = (
-                isinstance(raw_cache, dict)
-                and isinstance(raw_cache.get("dataset_hash"), str)
-                and isinstance(raw_cache.get("entries"), dict)
-            )
-            if is_new_format:
-                if raw_cache["dataset_hash"] != current_hash:
-                    logging.warning(
-                        f"MGA oracle fmax: dataset content changed since cache "
-                        f"was written (cached_hash={raw_cache['dataset_hash']}, "
-                        f"current_hash={current_hash}); discarding all "
-                        f"{len(raw_cache['entries'])} cached entries."
-                    )
-                    # leave cached_entries empty -> recompute everything
-                else:
-                    for axis_name, entry in raw_cache["entries"].items():
-                        if (
-                            isinstance(entry, dict)
-                            and isinstance(entry.get("members"), list)
-                            and "U_star" in entry
-                        ):
-                            cached_entries[axis_name] = {
-                                "members": sorted(str(m) for m in entry["members"]),
-                                "U_star": float(entry["U_star"]),
-                            }
-                    logging.info(
-                        f"MGA oracle fmax: loaded cache {cache_file} "
-                        f"({len(cached_entries)} entries, dataset_hash OK)."
-                    )
-            elif isinstance(raw_cache, dict) and raw_cache and all(
-                isinstance(k, str) and isinstance(v, (int, float))
-                for k, v in raw_cache.items()
-            ):
-                # Legacy flat format: {tech_name: U_star_float}. Implicit
-                # singleton membership. No dataset-hash check on legacy files.
-                cache_was_legacy = True
-                for axis_name, u_val in raw_cache.items():
-                    cached_entries[axis_name] = {
-                        "members": [axis_name],
-                        "U_star": float(u_val),
-                    }
-                logging.info(
-                    f"MGA oracle fmax: loaded legacy cache {cache_file} "
-                    f"({len(cached_entries)} entries); will upgrade to new "
-                    f"format on save."
-                )
-            else:
-                logging.warning(
-                    f"MGA oracle fmax: cache file {cache_file} has unrecognised "
-                    f"structure; ignoring it (computing fresh)."
-                )
-        else:
-            logging.info(f"MGA oracle fmax: no cache at {cache_file}; computing fresh.")
-
-        # --- Decide reuse vs. recompute per axis ---
-        members_by_name = {name: members for name, members in self.z_groups}
-        matched: list[str] = []
-        recompute_missing: list[str] = []
-        recompute_membership_changed: list[str] = []
+        # --- LP loop: maximise every axis over the near-optimal space ---
+        u_values: dict[str, float] = {}
         for name in self.z_names:
-            current_sorted = sorted(members_by_name[name])
-            if name not in cached_entries:
-                recompute_missing.append(name)
-            elif cached_entries[name]["members"] != current_sorted:
-                recompute_membership_changed.append(name)
-            else:
-                matched.append(name)
-        # Unused entries: cached axes the current run doesn't reference. We
-        # preserve them in the rewritten file (legacy behaviour) — they don't
-        # hurt anything and may be useful next run.
-        unused = sorted(set(cached_entries.keys()) - set(self.z_names))
-
-        if matched:
-            logging.info(
-                f"MGA oracle fmax: {len(matched)}/{self.n_z} axes matched "
-                f"from cache: {matched}"
-            )
-        if recompute_missing:
-            logging.info(
-                f"MGA oracle fmax: {len(recompute_missing)}/{self.n_z} axes "
-                f"missing from cache (will compute): {recompute_missing}"
-            )
-        if recompute_membership_changed:
-            logging.info(
-                f"MGA oracle fmax: {len(recompute_membership_changed)}/{self.n_z} "
-                f"axes have membership changed since cache was written "
-                f"(will recompute): {recompute_membership_changed}"
-            )
-        if unused:
-            logging.info(
-                f"MGA oracle fmax: {len(unused)} cache entries are unused by "
-                f"this run (preserved in the file): {unused}"
-            )
-
-        # --- LP loop for axes that need recompute ---
-        for name in recompute_missing + recompute_membership_changed:
-            members = members_by_name[name]
+            members = self._members_by_name[name]
             kind = self.axis_kind[name]
             # Objective: maximise the axis's value over the near-optimal space.
-            # Kind-aware (see _axis_linexpr): sum of capacity_addition for a
-            # tech axis, duration-weighted flow_import for a carrier axis.
+            # Kind-aware (see _axis_linexpr): sum of (selected-capacity-type)
+            # capacity_addition for a tech axis, duration-weighted flow_import
+            # for a carrier axis.
             obj = self._axis_linexpr(name)
             self.model.add_objective(obj, sense="max", overwrite=True)
             t0 = time.time()
@@ -790,36 +841,19 @@ class MGA:
                     f"means this axis has no finite near-optimal maximum — "
                     f"exclude the offending member ({hint})."
                 )
+            # Persist the full extreme near-optimal design for this axis using
+            # the same Postprocess machinery as the per-iteration solves.
+            self._postprocess(f"fmax_{name}")
             u_i = self._axis_value(name)
-            cached_entries[name] = {
-                "members": sorted(members),
-                "U_star": u_i,
-            }
+            u_values[name] = u_i
             logging.info(
                 f"MGA oracle fmax: U*[{name}] = {u_i:.6g} ({kind}, LP took "
                 f"{elapsed:.1f} s, {len(members)} "
-                f"member{'s' if len(members) != 1 else ''})."
+                f"member{'s' if len(members) != 1 else ''}; full design saved)."
             )
 
-        # --- Save cache in NEW format (upgrades legacy in place on first run) ---
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        out = {
-            "dataset_hash": current_hash,
-            "entries": {
-                name: {
-                    "members": list(entry["members"]),
-                    "U_star": entry["U_star"],
-                }
-                for name, entry in cached_entries.items()
-            },
-        }
-        with open(cache_file, "w") as f:
-            json.dump(out, f, indent=2, sort_keys=True)
-        upgrade_note = " (legacy format upgraded)" if cache_was_legacy else ""
-        logging.info(f"MGA oracle fmax: cache written to {cache_file}{upgrade_note}.")
-
         self.u_star = np.array(
-            [cached_entries[n]["U_star"] for n in self.z_names], dtype=float
+            [u_values[n] for n in self.z_names], dtype=float
         )
 
         # Sanity A7: every U_g* must be >= the baseline z_g* (it is by
@@ -945,14 +979,9 @@ class MGA:
         )
         return A0, b0
 
-    def _solve_and_postprocess(self, label: str) -> None:
-        """Solve current model state and write a Postprocess folder labelled `<base>_<label>`."""
-        self.optimization_setup.solve()
-        if not self.optimization_setup.optimality:
-            raise RuntimeError(
-                f"MGA solve failed (label={label}): "
-                f"termination = {self.model.termination_condition}"
-            )
+    def _postprocess(self, label: str) -> None:
+        """Write a Postprocess folder labelled `<base>_<label>` for the currently
+        loaded solution. Shared by the per-iteration solves and the fmax LPs."""
         base_name = self.postprocess_ctx["model_name"]
         Postprocess(
             self.optimization_setup,
@@ -962,6 +991,16 @@ class MGA:
             scenario_name=self.postprocess_ctx["scenario_name"],
             param_map=self.postprocess_ctx["param_map"],
         )
+
+    def _solve_and_postprocess(self, label: str) -> None:
+        """Solve current model state and write a Postprocess folder labelled `<base>_<label>`."""
+        self.optimization_setup.solve()
+        if not self.optimization_setup.optimality:
+            raise RuntimeError(
+                f"MGA solve failed (label={label}): "
+                f"termination = {self.model.termination_condition}"
+            )
+        self._postprocess(label)
 
     # ------------------------------------------------------------------
     # random_directions-mode callback
@@ -1099,13 +1138,18 @@ class MGA:
                         selector.loc[
                             {"set_technologies": m, self._z_dim: name}
                         ] = 1.0
-                Sx = (selector * self.cap_add).sum(
+                # _cap_keep restricts each tech to its selected capacity type
+                # (energy for storage, power otherwise) — same as _axis_linexpr.
+                Sx = (self._cap_keep * selector * self.cap_add).sum(
                     ["set_technologies", "set_capacity_types",
                      "set_location", "set_time_steps_yearly"]
                 )
             else:
-                # Pure singletons: dim IS set_technologies, byte-identical.
-                Sx = self.cap_add.sel(set_technologies=self.z_techs).sum(
+                # Pure singletons: dim IS set_technologies, byte-identical
+                # except for the _cap_keep capacity-type restriction.
+                Sx = (self._cap_keep * self.cap_add).sel(
+                    set_technologies=self.z_techs
+                ).sum(
                     ["set_capacity_types", "set_location", "set_time_steps_yearly"]
                 )
             zero_trial = xr.DataArray(
@@ -1364,9 +1408,10 @@ def run_mga(*args, **kwargs):
         Md_override = ora_cfg.get("Md_override", 1e8)
         t_max_override = ora_cfg.get("t_max_override", None)
 
-        # fmax: solve the n_z auxiliary U_i* LPs (cached on disk) BEFORE the
-        # projection model is added and before the ORACLE loop starts. These
-        # supply both the normalisation denominators and the initial outer box.
+        # fmax: solve the n_z auxiliary U_i* LPs (always solved, no cache; each
+        # full solution is saved via Postprocess) BEFORE the projection model is
+        # added and before the ORACLE loop starts. These supply both the
+        # normalisation denominators and the initial outer box.
         mga.compute_fmax_normalization()
 
         # Add projection model to the linopy problem (ONCE).
@@ -1404,7 +1449,9 @@ def run_mga(*args, **kwargs):
         pyomo_solver = pyo.SolverFactory(
             "gurobi", solver_io="python", manage_env=True
         )
-        pyomo_solver.set_options("OutputFlag=1 MIPGap=0.05")
+        pyomo_solver.set_options(
+            "OutputFlag=1 MIPGap=0.05 MIPGapAbs=0.001 TimeLimit=1800 Threads=10"
+        )
 
         algo = ORACLEAlgorithm(
             poly_approx=poly,
@@ -1438,10 +1485,30 @@ def run_mga(*args, **kwargs):
             # refine_approximations raised mid-way (Big-M violation, infeasible
             # projection, etc.). This avoids losing 25 of 30 successful
             # iterations because iteration 26 failed.
+            # Self-sufficient polytope file: A, b, X, name_list PLUS everything
+            # needed to de-normalise/interpret it (previously living in the now
+            # removed fmax cache and config.json). u_tilde/offset are NOT stored
+            # (exact repackaging of u_star, c_star, epsilon — see
+            # MGA.polytope_metadata). Metadata is a JSON string (no pickle).
+            meta = mga.polytope_metadata()
+            # Original physical unit strings (from the dataset/model), aligned
+            # 1:1 with name_list (design axes then the cost axis); "" where a
+            # unit is unavailable (e.g. solver.check_unit_consistency=False).
+            unit_by_name = {a["name"]: (a["unit"] or "") for a in meta["axes"]}
+            if meta["cost_axis"]:
+                unit_by_name[meta["cost_axis"]] = meta["cost_unit"] or ""
+            units_arr = np.array([unit_by_name.get(n, "") for n in poly.name_list])
             np.savez(
                 out / "polytope.npz",
                 A=poly.A, b=poly.b, X=poly.X,
                 name_list=np.array(poly.name_list),
+                u_star=mga.u_star,                       # design-axis maxima (z_names order)
+                c_star=float(mga.c_star),                # baseline net_present_cost
+                epsilon=float(mga.epsilon),
+                cost_axis=np.array(meta["cost_axis"] or ""),  # "" when include_cost is False
+                z_star=mga._z_star_design_raw,           # raw PHYSICAL baseline design
+                units=units_arr,                         # original units, aligned with name_list
+                axis_meta_json=np.array(json.dumps(meta)),
             )
             if df is not None:
                 df.to_csv(out / "diagnostics.csv", index=False)
