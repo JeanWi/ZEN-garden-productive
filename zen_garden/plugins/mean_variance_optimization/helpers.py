@@ -5,7 +5,7 @@ import pandas as pd
 import xarray as xr
 
 
-def _get_capex_specific(optimization_setup):
+def get_capex_specific(optimization_setup):
     """
     Reads all capex parameters from the optimization setup.
     """
@@ -158,7 +158,7 @@ def calculate_correlation_matrix(optimization_setup, no_correlation=False):
 
 def calculate_absolute_sd(optimization_setup):
     # Calculate absolute SD per technology
-    capex_specific_xr = _get_capex_specific(optimization_setup)
+    capex_specific_xr = get_capex_specific(optimization_setup)
     relative_sd_xr = _get_sd(optimization_setup)
     absolute_sd_xr = (capex_specific_xr * relative_sd_xr).stack(
         all_dims=["set_technologies", "set_location", "set_time_steps_yearly", "set_capacity_types"]
