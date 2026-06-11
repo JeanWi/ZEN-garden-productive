@@ -25,6 +25,7 @@ from zen_garden.wrapper.utils import load_results
 from zen_garden.model.element import Element
 from zen_garden.model.component import IndexSet
 from zen_garden.utils import linexpr_from_tuple_np
+import h5py  # type: ignore
 
 
 def check_for_semidefinite(correlation_matrix):
@@ -135,6 +136,7 @@ def generate_samples(
 
     col_idx = pd.MultiIndex.from_tuples(keys, names=["set_technologies", "set_capacity_types"])
     return pd.DataFrame(samples, columns=col_idx)
+
 
 
 class ModelApi:
@@ -324,7 +326,7 @@ class ModelApi:
 
     def fix_design_variables(self):
         fix_vars = [
-            "capacity_addition",
+            "capacity_addition"
         ]
 
         self._fix_variables(fix_vars)
@@ -338,7 +340,9 @@ class ModelApi:
             "flow_storage_charge",
             "flow_storage_discharge",
             "flow_transport",
-            "carbon_emissions_technology"
+            "carbon_emissions_technology",
+            "shed_demand",
+            "flow_transport_loss"
         ]
 
         self._fix_variables(fix_vars)
@@ -349,7 +353,7 @@ class ModelApi:
         self._reconstruct_storage_cost_constraints(sample)
         self._reconstruct_transport_cost_constraints(sample)
         self._reconstruct_conversion_cost_constraints(sample)
-        self._reconstruct_demand_shedding_constraint(demand_shedding_allowed)
+
 
     def _align_and_mask(self, expr, mask):
         """Aligns and masks expr.
@@ -612,3 +616,30 @@ class ModelApi:
 
         self.optimization_setup.model.add_constraints(lhs_shed_demand, "<=", rhs_shed_demand, name="constraint_limit_shed_demand")
         self.optimization_setup.model.add_constraints(lhs_cost, "==", rhs_cost, name="constraint_cost_shed_demand")
+
+    def delete_not_required_constraints(self):
+
+        remove = [
+            "constraint_availability_import",
+            "constraint_availability_export",
+            "constraint_availability_import_yearly",
+            "constraint_availability_export_yearly",
+            "constraint_limit_shed_demand",
+            "constraint_nodal_energy_balance",
+            "constraint_technology_capacity_limit_not_reached",
+            "constraint_technology_capacity_limit_reached",
+            "constraint_capacity_factor_conversion",
+            "constraint_carrier_conversion",
+            "constraint_minimum_full_load_hours",
+            "constraint_capacity_factor_storage",
+            "constraint_storage_level_max",
+            "constraint_capacity_energy_to_power_ratio_min",
+            "constraint_capacity_energy_to_power_ratio_max",
+            "constraint_capacity_factor_transport",
+            "constraint_transport_technology_losses_flow",
+        ]
+
+
+        for constr in remove:
+            self.optimization_setup.model.remove_constraints(constr)
+
