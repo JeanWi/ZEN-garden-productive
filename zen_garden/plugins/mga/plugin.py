@@ -1481,10 +1481,21 @@ def run_mga(*args, **kwargs):
                 )
                 df = algo.refine_approximations()
         finally:
+            # Convergence summary first, so the outcome can be stored in the
+            # polytope file. df is None when refine_approximations raised mid-way
+            # (Big-M violation, infeasible projection, etc.).
+            if df is not None:
+                final_dist = float(df["max_min_distance"].iloc[-1])
+                n_iters_done = len(df)
+                converged = bool(final_dist <= tol)
+            else:
+                final_dist = float("nan")
+                n_iters_done = 0
+                converged = False
+
             # Persist polytope (and diagnostics if available) even if
-            # refine_approximations raised mid-way (Big-M violation, infeasible
-            # projection, etc.). This avoids losing 25 of 30 successful
-            # iterations because iteration 26 failed.
+            # refine_approximations raised mid-way. This avoids losing 25 of 30
+            # successful iterations because iteration 26 failed.
             # Self-sufficient polytope file: A, b, X, name_list PLUS everything
             # needed to de-normalise/interpret it (previously living in the now
             # removed fmax cache and config.json). u_tilde/offset are NOT stored
@@ -1498,8 +1509,13 @@ def run_mga(*args, **kwargs):
             if meta["cost_axis"]:
                 unit_by_name[meta["cost_axis"]] = meta["cost_unit"] or ""
             units_arr = np.array([unit_by_name.get(n, "") for n in poly.name_list])
+            # Name the polytope file after the run: the last "_"-token of the
+            # output folder (e.g. ".../cb_2050gf_ORACLE_06" -> "polytope_06.npz"),
+            # so the file is self-identifying when collected across runs.
+            run_id = Path(optimization_setup.analysis.folder_output).name.split("_")[-1]
+            poly_file = f"polytope_{run_id}.npz" if run_id else "polytope.npz"
             np.savez(
-                out / "polytope.npz",
+                out / poly_file,
                 A=poly.A, b=poly.b, X=poly.X,
                 name_list=np.array(poly.name_list),
                 u_star=mga.u_star,                       # design-axis maxima (z_names order)
@@ -1508,6 +1524,12 @@ def run_mga(*args, **kwargs):
                 cost_axis=np.array(meta["cost_axis"] or ""),  # "" when include_cost is False
                 z_star=mga._z_star_design_raw,           # raw PHYSICAL baseline design
                 units=units_arr,                         # original units, aligned with name_list
+                tolerance=float(tol),                    # ORACLE convergence tolerance (from config)
+                converged=bool(converged),               # final_max_min_distance <= tolerance
+                final_max_min_distance=float(final_dist),  # achieved max distance between the
+                                                         # outer and inner approximations; this is
+                                                         # the effective tolerance when NOT converged
+                                                         # (NaN if the run raised before any result)
                 axis_meta_json=np.array(json.dumps(meta)),
             )
             if df is not None:
@@ -1515,9 +1537,6 @@ def run_mga(*args, **kwargs):
             # Convergence status only meaningful if refine_approximations
             # completed normally (df is not None means it returned a result).
             if df is not None:
-                final_dist = float(df["max_min_distance"].iloc[-1])
-                n_iters_done = len(df)
-                converged = final_dist <= tol
                 if converged:
                     logging.info(
                         f"MGA oracle: CONVERGED in {n_iters_done} iterations. "
@@ -1534,7 +1553,7 @@ def run_mga(*args, **kwargs):
                     "MGA oracle: refine_approximations did not return a result "
                     "(likely raised mid-iteration). See traceback above."
                 )
-            logging.info(f"MGA oracle: artifacts saved to {out}")
+            logging.info(f"MGA oracle: artifacts saved to {out} (polytope: {poly_file})")
 
     else:
         raise ValueError(
