@@ -84,15 +84,20 @@ for index, row in sample.iterrows():
     m_api.optimization_setup.solver.solver_options["Method"] = 0
     m_api.optimization_setup.solver.solver_options["NumericFocus"] = 3
     m_api.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
-    m_api.optimization_setup.solver.solver_options["Presolve"] = 0
     m_api.reconstruct_cost_constraints(row)
 
-    m_api.solve_model(skip_postprocess = True, skip_scaling=True)
+    try:
+        m_api.solve_model(skip_postprocess=True, skip_scaling=True)
 
-    total_cost = m_api.optimization_setup.model.objective.value
+        total_cost = m_api.optimization_setup.model.objective.value
+
+
+    except:
+        total_cost = -1
 
     objective.loc[index, key] = total_cost
-    pd.DataFrame(objective).to_csv(f"./outputs_{time_str}_{dir_extension}/objective_samples.csv", index=False)
+    pd.DataFrame(objective).to_csv(f"./outputs_{time_str}_{dir_extension}/objective_samples.csv",
+                                   index=False)
 
 
 
@@ -136,15 +141,21 @@ for variance_inclusion in include_var_for.keys():
         m_api.delete_not_required_constraints()
 
         for index, row in sample.iterrows():
-            m_api.reconstruct_cost_constraints(row)
             m_api.optimization_setup.solver.solver_options["Method"] = 0
+            m_api.optimization_setup.solver.solver_options["NumericFocus"] = 3
+            m_api.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
+            m_api.reconstruct_cost_constraints(row)
 
-            m_api.solve_model(skip_postprocess = True, skip_scaling=True)
+            try:
+                m_api.solve_model(skip_postprocess=True, skip_scaling=True)
 
-            total_cost = m_api.optimization_setup.model.objective.value
+                total_cost = m_api.optimization_setup.model.objective.value
+
+
+            except:
+                total_cost = -1
 
             objective.loc[index, key] = total_cost
-            print(objective)
             pd.DataFrame(objective).to_csv(f"./outputs_{time_str}_{dir_extension}/objective_samples.csv",
                                            index=False)
 
