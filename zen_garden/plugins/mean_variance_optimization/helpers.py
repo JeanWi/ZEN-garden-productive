@@ -3,7 +3,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
-
+import scipy.sparse as sp
+import itertools
 
 def get_capex_specific(optimization_setup):
     """
@@ -62,101 +63,30 @@ def _get_sd(optimization_setup):
 
     return sd_xr
 
-
-def _get_correlation(optimization_setup, no_correlation=False):
+def _get_correlation_matrix(optimization_setup):
     """
     Reads all correlations from file and preprocess them.
-    
+
     If no_correlation=True, returns identity correlation matrix (diagonal=1, off-diagonal=0).
     """
     tech_capex_path = Path(optimization_setup.analysis.dataset) / "mean_variance" / "technology_capex"
-    technologies = list(optimization_setup.sets["set_technologies"])
-    time_steps_yearly = optimization_setup.sets["set_time_steps_yearly"]
 
-    correlation_df = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
-    correlation_np = correlation_df.to_numpy()
-    lam = 1e-4
-    correlation_reg = (1 - lam) * correlation_np + lam * np.eye(correlation_np.shape[0])
-    correlation = pd.DataFrame(
-        correlation_reg,
-        index=correlation_df.index,
-        columns=correlation_df.index
-    )
+    tec_correlation_df = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
 
-    auto_correlation = pd.read_csv(tech_capex_path / "autocorrelation.csv", index_col=0)
+    R_T = tec_correlation_df.values
+    R_T = sp.csr_matrix(R_T)
 
-    # Correlation matrix
-    corr_xr = xr.DataArray(
-        correlation.loc[technologies, technologies].values,
-        dims=("set_technologies_i", "set_technologies_j"),
-        coords={
-            "set_technologies_i": technologies,
-            "set_technologies_j": technologies,
-        },
-    )
+    index = list(itertools.product(
+        tec_correlation_df.index,
+    ))
+    index_map = {
+        key: i for i, key in enumerate(index)
+    }
 
-    # Autocorrelation matrix
-    auto_corr_xr = xr.DataArray(
-        auto_correlation.loc[technologies, "value"].values,
-        dims=("set_technologies",),
-        coords={"set_technologies": technologies},
-    )
-    time_xr = xr.DataArray(
-        time_steps_yearly,
-        dims=("set_time_steps_yearly",),
-        coords={"set_time_steps_yearly": time_steps_yearly},
-    )
-    dt = abs(
-        time_xr.rename(set_time_steps_yearly="set_time_steps_yearly_i")
-        - time_xr.rename(set_time_steps_yearly="set_time_steps_yearly_j")
-    )
-    time_corr = auto_corr_xr ** dt
-
-    # Full correlation
-    full_corr = (
-            corr_xr
-            * time_corr.rename(set_technologies="set_technologies_i")
-    )
-
-    if no_correlation:
-        # Return identity correlation matrix: diagonal = 1, off-diagonal = 0
-        n_techs = len(technologies)
-        identity_corr = np.eye(n_techs)
-        full_corr = xr.DataArray(
-            identity_corr,
-            dims=("set_technologies_i", "set_technologies_j"),
-            coords={
-                "set_technologies_i": technologies,
-                "set_technologies_j": technologies,
-            },
-        )
-
-    return full_corr
+    return (index_map, R_T)
 
 
-def generate_covariance_pairs(absolute_sd_per_tech, corr_df):
-    valid_tech_cap = set(absolute_sd_per_tech.index)
-    valid_df = pd.DataFrame(list(valid_tech_cap), columns=["tech", "cap"])
-    pairs = valid_df.add_suffix("_i").merge(valid_df.add_suffix("_j"), how="cross")
-    pairs = pairs.merge(corr_df, on=["tech_i", "tech_j"], how="inner")
-    return pairs
-
-
-def calculate_correlation_matrix(optimization_setup, no_correlation=False):
-    corr_xr = _get_correlation(optimization_setup, no_correlation=no_correlation)
-    corr_series = (
-        corr_xr.to_series()
-        .groupby(level=["set_technologies_i", "set_technologies_j"])
-        .mean()
-        .dropna()
-    )
-    corr_series = corr_series[corr_series != 0]
-    corr_df = corr_series.reset_index()
-    corr_df.columns = ["tech_i", "tech_j", "correlation"]
-    return corr_df
-
-
-def calculate_absolute_sd(optimization_setup):
+def _calculate_absolute_sd(optimization_setup):
     # Calculate absolute SD per technology
     capex_specific_xr = get_capex_specific(optimization_setup)
     relative_sd_xr = _get_sd(optimization_setup)
@@ -165,9 +95,182 @@ def calculate_absolute_sd(optimization_setup):
     ).dropna("all_dims")
     absolute_sd_per_tech = (
         absolute_sd_xr.to_series()
-        .groupby(level=["set_technologies", "set_capacity_types"])
-        .mean()
-        .dropna()
     )
     absolute_sd_per_tech = absolute_sd_per_tech[absolute_sd_per_tech != 0]
     return absolute_sd_per_tech
+
+
+def _determine_allowed_aggregation(df):
+    results = {}
+
+    dims = ["set_location", "set_time_steps_yearly", "set_capacity_types"]
+
+    for tech, sub in df.groupby("set_technologies"):
+
+        results[tech] = {}
+
+        aggregation_dimensions = []
+        for dim in dims:
+            # check if within-dim values are all identical
+            is_constant = sub.groupby(dim)["value"].mean().nunique() == 1
+            if is_constant:
+                aggregation_dimensions.append(dim)
+
+        results[tech] = aggregation_dimensions
+
+    return results
+
+def _aggregate_by_structure(df, aggregation):
+    out = []
+
+    for tech, sub in df.groupby("set_technologies"):
+
+        var_dims = aggregation[tech]
+        group_dims = [
+            dim for dim in [
+                "set_location",
+                "set_time_steps_yearly",
+                "set_capacity_types"
+            ]
+            if dim not in var_dims
+        ]
+
+        agg = sub.groupby(
+            ["set_technologies"] + group_dims
+        )["value"].mean().reset_index()
+
+
+        # replace collapsed dims with "aggregated"
+        for dim in ["set_location", "set_time_steps_yearly", "set_capacity_types"]:
+            if dim not in group_dims:
+                agg[dim] = "aggregated"
+
+        out.append(agg)
+
+    return pd.concat(out, ignore_index=True)
+
+def is_psd(A, tol=1e-8):
+    eigvals = np.linalg.eigvalsh(A)
+    return eigvals.min() >= -tol
+
+
+def _get_covariance_matrix(absolute_sd_per_tech_aggregated, correlation_matrix, correlation_matrix_index_map):
+    tuples = list(
+        absolute_sd_per_tech_aggregated[
+            [
+                "set_technologies",
+                "set_location",
+                "set_time_steps_yearly",
+                "set_capacity_types",
+            ]
+        ].itertuples(index=False, name=None)
+    )
+
+    print(f"Correlation matrix is PSD:{is_psd(correlation_matrix)}")
+
+
+    tech_idx = np.array([
+        correlation_matrix_index_map[(t[0],)]
+        for t in tuples
+    ])
+
+    expanded = correlation_matrix[np.ix_(tech_idx, tech_idx)]
+
+    correlation_matrix_expanded = pd.DataFrame(
+        expanded,
+        index=tuples,
+        columns=tuples,
+    )
+
+    print(f"Expanded correlation matrix is PSD:{is_psd(expanded)}")
+
+
+    covariance_index = list(
+        absolute_sd_per_tech_aggregated[
+            [
+                "set_technologies",
+                "set_location",
+                "set_time_steps_yearly",
+                "set_capacity_types",
+            ]
+        ].itertuples(index=False, name=None)
+    )
+
+    covariance_index_map = {
+        idx: i
+        for i, idx in enumerate(covariance_index)
+    }
+    sd = absolute_sd_per_tech_aggregated["value"].to_numpy()
+
+    R = sp.coo_matrix(correlation_matrix_expanded.values)
+
+
+    Sigma = sp.coo_matrix(
+        (
+            R.data * sd[R.row] * sd[R.col],
+            (R.row, R.col),
+        ),
+        shape=R.shape,
+    ).tocsr()
+
+    Sigma = sp.triu(Sigma, format="csr")
+
+
+    print(f"Covariance matrix is PSD:{is_psd(Sigma.toarray())}")
+
+
+    return covariance_index_map, Sigma
+
+def _regularize_correlation_matrix(correlation_matrix, term):
+    corr = correlation_matrix.toarray()
+    lam = term
+    correlation_matrix = (1 - lam) * corr + lam * np.eye(corr.shape[0])
+    return correlation_matrix
+
+def generate_covariance_matrix(optimization_setup):
+
+    # Get absolute SD
+    absolute_sd_per_tech = _calculate_absolute_sd(optimization_setup)
+    absolute_sd_per_tech = absolute_sd_per_tech.swaplevel(1, 2)
+
+    aggregation = _determine_allowed_aggregation(absolute_sd_per_tech.reset_index(name="value"))
+    absolute_sd_per_tech_aggregated = _aggregate_by_structure(absolute_sd_per_tech.reset_index(name="value"),
+                                                             aggregation)
+
+    # Get correlation matrix
+    correlation_matrix_index_map, correlation_matrix = _get_correlation_matrix(optimization_setup)
+    correlation_matrix = _regularize_correlation_matrix (correlation_matrix, term = 10e-6)
+
+    # Get covariance matrix
+    covariance_index_map, covariance_matrix = _get_covariance_matrix(absolute_sd_per_tech_aggregated, correlation_matrix, correlation_matrix_index_map)
+
+    return covariance_index_map, covariance_matrix
+
+def get_non_zero_elements(covariance_matrix, covariance_matrix_indexmap):
+    coo = covariance_matrix.tocoo()
+    inv_index_map = {v: k for k, v in covariance_matrix_indexmap.items()}
+    nonzero_entries = [
+        (inv_index_map[i], inv_index_map[j])
+        for i, j in zip(coo.row, coo.col)
+    ]
+    return nonzero_entries
+
+
+def generate_sum_list(technology, location, time_step_year, capacity_type):
+    sum_list = []
+    selection_dict = {"set_technologies":technology}
+    if location != "aggregated":
+        selection_dict["set_location"] = location
+    else:
+        sum_list.append("set_location")
+
+    if time_step_year != "aggregated":
+        selection_dict["set_time_steps_yearly"] = time_step_year
+    else:
+        sum_list.append("set_time_steps_yearly")
+
+    if capacity_type != "aggregated":
+        selection_dict["set_capacity_types"] = capacity_type
+    else:
+        sum_list.append("set_capacity_types")
+    return selection_dict, sum_list

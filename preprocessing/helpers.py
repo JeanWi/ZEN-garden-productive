@@ -103,8 +103,8 @@ def build_covariance_matrix(
 
 
 def generate_samples(
-    pairs: pd.DataFrame,
-    absolute_sd_per_tech: pd.Series,
+    covariance_matrix,
+    covariance_map,
     n_samples: int = 1000,
     mean: pd.Series | None = None,
     seed: int | None = None,
@@ -123,20 +123,64 @@ def generate_samples(
     Returns:
         DataFrame of shape (n_samples, n_assets) where columns are (tech, cap) tuples.
     """
-    cov_df, keys = build_covariance_matrix(pairs, absolute_sd_per_tech)
-    cov_np = cov_df.values
-
-    if mean is None:
-        mean_np = np.zeros(len(keys))
-    else:
-        mean_np = np.array([float(mean[k]) for k in keys])
 
     rng = np.random.default_rng(seed)
-    samples = rng.multivariate_normal(mean_np, cov_np, size=n_samples)
 
-    col_idx = pd.MultiIndex.from_tuples(keys, names=["set_technologies", "set_capacity_types"])
-    return pd.DataFrame(samples, columns=col_idx)
 
+    # --- dense upper triangle ---
+    cov_upper = covariance_matrix.toarray()
+
+    # --- symmetrize correctly ---
+    cov = cov_upper + cov_upper.T - np.diag(np.diag(cov_upper))
+
+    n = cov.shape[0]
+
+    # --- mean ---
+    if mean is None:
+        mu = np.zeros(n)
+    else:
+        inv_map = {v: k for k, v in covariance_map.items()}
+        mu = np.array([mean.get(inv_map[i], 0.0) for i in range(n)])
+
+    # --- optional PSD repair (important if numerical issues exist) ---
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvals[eigvals < 0] = 1e-12
+    cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+    # --- sampling ---
+    samples = rng.multivariate_normal(mu, cov, size=n_samples)
+
+    # --- labels ---
+    inv_map = {v: k for k, v in covariance_map.items()}
+    cols = [inv_map[i] for i in range(n)]
+
+
+    return pd.DataFrame(samples, columns=cols)
+
+def generate_delta_xr(sample, techs, original_cost_xr, tech_dim, location_dim):
+    delta = pd.DataFrame(sample.index.tolist(),
+                         columns=[tech_dim, location_dim, "set_time_steps_yearly", "set_capacity_types"])
+    values = sample.values.tolist()
+    delta["values"] = values
+
+    delta_filtered = delta[delta[tech_dim].isin(techs)]
+
+    delta_xr = xr.zeros_like(original_cost_xr)
+    for _, row in delta_filtered.iterrows():
+
+        selector = {}
+
+        for dim in delta_xr.dims:
+            val = row[dim]
+
+            if val == "aggregated":
+                selector[dim] = delta_xr.coords[dim]
+            else:
+                selector[dim] = [val]
+
+        delta_xr.loc[selector] += row["values"]
+
+    return delta_xr
 
 
 class ModelApi:
@@ -348,7 +392,7 @@ class ModelApi:
         self._fix_variables(fix_vars)
 
 
-    def reconstruct_cost_constraints(self, sample, demand_shedding_allowed = False):
+    def reconstruct_cost_constraints(self, sample):
 
         self._reconstruct_storage_cost_constraints(sample)
         self._reconstruct_transport_cost_constraints(sample)
@@ -399,17 +443,12 @@ class ModelApi:
         capex_specific_storage_original = self.capex_specific_storage.copy()
 
         tech_dim = "set_storage_technologies"
+        location_dim = "set_nodes"
         techs = capex_specific_storage_original.coords[tech_dim].values
-        caps = capex_specific_storage_original.coords["set_capacity_types"].values
 
-        # Build a 2D DataArray (tech × cap_type) from the sample, aligned to the xarray coords
-        delta = xr.DataArray(
-            [[float(sample.get((t, c), 0.0)) for c in caps] for t in techs],
-            dims=[tech_dim, "set_capacity_types"],
-            coords={tech_dim: techs, "set_capacity_types": caps},
-        )
+        delta_xr = generate_delta_xr(sample, techs, capex_specific_storage_original, tech_dim, location_dim)
 
-        capex_specific_storage = capex_specific_storage_original + delta.broadcast_like(capex_specific_storage_original)
+        capex_specific_storage = capex_specific_storage_original + delta_xr
 
 
 
@@ -462,15 +501,12 @@ class ModelApi:
 
 
         tech_dim = "set_conversion_technologies"
+        location_dim = "set_nodes"
         techs = capex_specific_conversion_original.coords[tech_dim].values
 
-        delta = xr.DataArray(
-            [float(sample.get((t, "energy"), 0.0)) for t in techs],
-            dims=[tech_dim],
-            coords={tech_dim: techs},
-        )
+        delta_xr = generate_delta_xr(sample, techs, capex_specific_conversion_original, tech_dim, location_dim)
 
-        capex_specific_conversion = capex_specific_conversion_original + delta.broadcast_like(capex_specific_conversion_original)
+        capex_specific_conversion = capex_specific_conversion_original + delta_xr
 
 
         capex_specific_conversion = capex_specific_conversion.broadcast_like(
@@ -525,15 +561,12 @@ class ModelApi:
 
         capex_specific_transport_original = self.capex_specific_transport.copy()
         tech_dim = "set_transport_technologies"
+        location_dim = "set_edges"
         techs = capex_specific_transport_original.coords[tech_dim].values
 
-        delta = xr.DataArray(
-            [float(sample.get((t, "power"), 0.0)) for t in techs],
-            dims=[tech_dim],
-            coords={tech_dim: techs},
-        )
+        delta_xr = generate_delta_xr(sample, techs, capex_specific_transport_original, tech_dim, location_dim)
 
-        capex_specific_transport = capex_specific_transport_original + delta.broadcast_like(capex_specific_transport_original)
+        capex_specific_transport = capex_specific_transport_original + delta_xr
 
 
         ### auxiliary calculations TODO improve

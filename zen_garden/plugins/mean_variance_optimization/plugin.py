@@ -1,14 +1,9 @@
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from pathlib import Path
-import os
 
 from zen_garden.plugin_system.events import Event, EventPublisher
-from zen_garden.plugins.mean_variance_optimization.helpers import calculate_absolute_sd, calculate_correlation_matrix, \
-    generate_covariance_pairs
-
-from zen_garden.model.element import Element
+from zen_garden.plugins.mean_variance_optimization.helpers import generate_sum_list, generate_covariance_matrix, \
+    get_non_zero_elements
 
 config = {
     "weighting_factor": None,
@@ -27,76 +22,62 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
     """
     model = optimization_setup.model
 
-    if "capacity_addition_tech_agg" not in model.variables:
-        variables = optimization_setup.variables
+    # Get covariance matrix
+    covariance_matrix_indexmap, covariance_matrix  = generate_covariance_matrix(optimization_setup)
 
-        variables.add_variable(
-            model,
-            name="capacity_addition_tech_agg",
-            index_sets=Element.create_custom_set(
-                [
-                    "set_technologies",
-                    "set_capacity_types"
-                ],
-                optimization_setup,
-            ),
-            bounds=(0, np.inf),
-            doc="size of installed technology at location l and time t",
-            unit_category={"energy_quantity": 1, "time": -1},
-        )
+    # Get non-zero entries
+    covariance_pairs = get_non_zero_elements(covariance_matrix, covariance_matrix_indexmap)
+
+    # Construct variables (only have integer indexing)
+    agg_index = pd.Index(
+        range(len(covariance_matrix_indexmap)),
+        name="agg_index"
+    )
+    inverse_index_map = {
+        v: k
+        for k, v in covariance_matrix_indexmap.items()
+    }
+
+    optimization_setup.model.add_variables(
+        name="capacity_addition_tech_agg",
+        coords=[agg_index],
+    )
+
+    # Construct constraints for aggregate variables
+    for variable_index, variable_key in tqdm(inverse_index_map.items(), total=len(inverse_index_map),
+                       desc="Constructing aggregate variables"):
 
 
-    # Create constraint aggregating technology capacities over locations and investment periods
-    if "constraint_capacity_addition_tech_agg" not in model.constraints:
-        lhs_exp = model.variables["capacity_addition_tech_agg"]
-        rhs_exp = model.variables["capacity_addition"].sum(["set_location", "set_time_steps_yearly"])
+        technology = variable_key[0]
+        location = variable_key[1]
+        time_step_year = variable_key[2]
+        capacity_type = variable_key[3]
+
+        selection_dict, sum_list = generate_sum_list(technology, location, time_step_year, capacity_type)
+
+        lhs_exp = model.variables["capacity_addition_tech_agg"].sel(agg_index=variable_index)
+        rhs_exp = model.variables["capacity_addition"].sel(selection_dict).sum(sum_list)
         constraint_capacity_addition = lhs_exp == rhs_exp
 
-
         optimization_setup.constraints.add_constraint(
-            "constraint_capacity_addition_tech_agg", constraint_capacity_addition
+            f"constraint_capacity_addition_tech_agg{variable_index}", constraint_capacity_addition
         )
 
+    # Construct quadratic term
+    for pair in tqdm(covariance_pairs, total=len(covariance_pairs),
+                       desc="Constructing quadratic variance term (technology correlation)"):
+        index_i = covariance_matrix_indexmap[pair[0]]
+        index_j = covariance_matrix_indexmap[pair[1]]
+        covariance = covariance_matrix[index_i, index_j]
 
-    # Absolute SD per technology
-    absolute_sd_per_tech = calculate_absolute_sd(optimization_setup)
+        C_i = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_i)
+        C_j = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_j)
 
-    # Correlation per technology pair
-    corr_df = calculate_correlation_matrix(optimization_setup)
-
-    # Build (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
-    pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
-    #
-    # Quadratic term using the auxiliary variable
-    covariance_rows = []
-    capacity_addition_tech_agg = model.variables["capacity_addition_tech_agg"]
-    for _, row in tqdm(pairs.iterrows(), total=len(pairs),
-                       desc="Constructing quadratic variance term (technology-only correlation)"):
-        tech_i, cap_i = row["tech_i"], row["cap_i"]
-        tech_j, cap_j = row["tech_j"], row["cap_j"]
-        correlation = row["correlation"]
-
-        sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
-        sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
-
-        C_i = capacity_addition_tech_agg.sel(set_technologies=tech_i, set_capacity_types=cap_i)
-        C_j = capacity_addition_tech_agg.sel(set_technologies=tech_j, set_capacity_types=cap_j)
-
-        scalar_coeff = correlation * sigma_i * sigma_j
-        quadratic_term += scalar_coeff * C_i * C_j
-
-    #     covariance_rows.append({
-    #         "tech_i": tech_i,
-    #         "cap_i": cap_i,
-    #         "tech_j": tech_j,
-    #         "cap_j": cap_j,
-    #         "covariance": correlation * sigma_i * sigma_j,
-    #     })
-
-    # dir = Path(optimization_setup.analysis.folder_output).joinpath(os.path.basename(optimization_setup.analysis.dataset))
-    # pd.DataFrame(covariance_rows).to_csv(
-    #     dir / "covariance_pairs_objective_construction.csv", index=False
-    # )
+        if index_i != index_j:
+            factor = 2
+        else:
+            factor = 1
+        quadratic_term += factor * covariance * C_i * C_j
 
     return quadratic_term
 
@@ -112,15 +93,15 @@ def calculate_variance_from_solution(postprocessing=None):
     The scalars are injected into ``model._solution`` so that ``save_var`` exports
     them automatically as ``capex_variance`` and ``capex_sd``.
     """
-    # Absolute SD per technology
-    absolute_sd_per_tech = calculate_absolute_sd(postprocessing.optimization_setup)
 
-    # Correlation per technology pair
-    corr_df = calculate_correlation_matrix(postprocessing.optimization_setup)
+    # Get covariance matrix
+    covariance_matrix_indexmap, covariance_matrix  = generate_covariance_matrix(postprocessing.optimization_setup)
+    covariance_pairs = get_non_zero_elements(covariance_matrix, covariance_matrix_indexmap)
 
-    # Build upper-triangle (tech_i, cap_i) × (tech_j, cap_j) pairs with correlation
-    pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
-
+    inverse_index_map = {
+        v: k
+        for k, v in covariance_matrix_indexmap.items()
+    }
     # Solved capacity additions → aggregate over locations and time steps
     capacity_addition_sol = (
         postprocessing.optimization_setup.model.variables["capacity_addition"]
@@ -130,25 +111,37 @@ def calculate_variance_from_solution(postprocessing=None):
 
     variance = 0.0
     covariance_rows = []
-    for _, row in pairs.iterrows():
-        tech_i, cap_i = row["tech_i"], row["cap_i"]
-        tech_j, cap_j = row["tech_j"], row["cap_j"]
-        correlation = row["correlation"]
+    for pair in tqdm(covariance_pairs, total=len(covariance_pairs),
+                       desc="Postprocessing variance"):
 
-        sigma_i = absolute_sd_per_tech[(tech_i, cap_i)]
-        sigma_j = absolute_sd_per_tech[(tech_j, cap_j)]
+        technology_i = pair[0][0]
+        technology_j = pair[1][0]
 
-        C_i = float(capacity_addition_sol.sel(set_technologies=tech_i, set_capacity_types=cap_i))
-        C_j = float(capacity_addition_sol.sel(set_technologies=tech_j, set_capacity_types=cap_j))
+        location_i = pair[0][1]
+        location_j = pair[1][1]
 
-        variance += correlation * sigma_i * sigma_j * C_i * C_j
+        time_step_year_i = pair[0][2]
+        time_step_year_j = pair[1][2]
+
+        capacity_type_i = pair[0][3]
+        capacity_type_j = pair[1][3]
+
+        index_i = covariance_matrix_indexmap[pair[0]]
+        index_j = covariance_matrix_indexmap[pair[1]]
+        covariance = covariance_matrix[index_i, index_j]
+
+        selection_dict_i, sum_list_i = generate_sum_list(technology_i, location_i, time_step_year_i, capacity_type_i)
+        selection_dict_j, sum_list_j = generate_sum_list(technology_j, location_j, time_step_year_j, capacity_type_j)
+
+
+        C_i = float(postprocessing.optimization_setup.model.variables["capacity_addition"].solution.sel(selection_dict_i).sum(sum_list_i))
+        C_j = float(postprocessing.optimization_setup.model.variables["capacity_addition"].solution.sel(selection_dict_j).sum(sum_list_j))
+
+        variance += covariance * C_i * C_j
 
         covariance_rows.append({
-            "tech_i": row["tech_i"],
-            "cap_i": row["cap_i"],
-            "tech_j": row["tech_j"],
-            "cap_j": row["cap_j"],
-            "covariance": row["correlation"] * sigma_i * sigma_j,
+            "pair": pair,
+            "covariance": covariance * C_i * C_j,
         })
 
     plugin_reporting = {}
