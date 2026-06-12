@@ -36,14 +36,15 @@ Configuration (via the "plugins.mga" block in config.json):
         dict per iteration.
     oracle (dict): oracle mode only. max_iterations (int), tolerance (float,
         REQUIRED — no default), Md_override (float), t_max_override
-        (float|None), include_cost (bool, default False). A legacy
-        "normalization" key is ignored. Solver is hardcoded to Gurobi.
+        (float|None), include_cost (bool, default False), milp_options (dict
+        of Gurobi options for ORACLE's internal polytope MILPs; defaults to
+        DEFAULT_MILP_OPTIONS). Solver is hardcoded to Gurobi.
 """
 
-import json
 import logging
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,13 @@ import xarray as xr
 
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
+
+from .polytope_io import (
+    CARRIER_IMPORT,
+    TECH_CAPACITY,
+    Polytope,
+    save_polytope,
+)
 
 
 # Module-level config dict. The plugin loader merges user values from
@@ -66,6 +74,43 @@ config = {
     "iterations": [],
     "oracle": {},
 }
+
+# Default Gurobi options for ORACLE's internal polytope MILPs; override via
+# the oracle.milp_options config key (values must be numbers or strings).
+DEFAULT_MILP_OPTIONS = {
+    "OutputFlag": 1,
+    "MIPGap": 0.05,
+    "MIPGapAbs": 0.001,
+    "TimeLimit": 1800,
+    "Threads": 10,
+}
+
+# Coordinate dimension of the per-axis projection variables/constraints.
+Z_DIM = "mga_z_axis"
+
+# Substring needles for locating levels in the units-series MultiIndex (the
+# level names vary slightly across ZEN-garden versions, e.g. "technology" vs
+# "set_technologies"; see MGA._find_level).
+_LEVEL_TECH = "technolog"
+_LEVEL_CAPACITY_TYPE = "capacity_type"
+_LEVEL_CARRIER = "carrier"
+
+
+@dataclass(frozen=True)
+class Axis:
+    """One exploration axis of the MGA polytope.
+
+    kind is TECH_CAPACITY (members are technologies; axis value = sum of
+    capacity_addition over members, restricted to the selected capacity type)
+    or CARRIER_IMPORT (members are carriers; axis value = duration-weighted
+    annual flow_import over members). capacity_type is the "+"-joined selected
+    capacity type(s) for tech axes and None for carrier axes.
+    """
+
+    name: str
+    kind: str
+    members: tuple[str, ...]
+    capacity_type: str | None
 
 
 def _parse_axis_entries(entries, valid_members, group_name_reserved,
@@ -209,15 +254,9 @@ class MGA:
         self._u_tilde = None
         self._offset = None
 
-        # --- Build the canonical list of exploration AXES ---
-        # Each axis is a (name, members) tuple carrying a KIND in self.axis_kind:
-        #   "tech_capacity"  -> members are technologies; the axis value is the
-        #                       sum of capacity_addition over members.
-        #   "carrier_import" -> members are carriers; the axis value is the
-        #                       duration-weighted annual flow_import over members.
-        # z_groups is the SINGLE source of truth for the ordering of z, mu,
-        # name_list everywhere downstream. Tech axes come first (in the order
-        # implied by include_techs/exclude_techs), then carrier axes (user order).
+        # --- Build the canonical list of exploration axes (see class Axis) ---
+        # Tech axes come first (in the order implied by include_techs /
+        # exclude_techs), then carrier axes (user order).
         all_techs = list(self.cap_add.coords["set_technologies"].values)
         all_techs_set = set(all_techs)
         # Carriers (for carrier-import axes + the group-name reserved set).
@@ -262,54 +301,38 @@ class MGA:
                 )
             z_groups = [(t, [t]) for t in all_techs if t not in excluded_set]
 
-        # Tech axes are now in z_groups. Record their kind and reserve their
-        # names, then append carrier-import axes.
-        axis_kind: dict[str, str] = {name: "tech_capacity" for name, _ in z_groups}
-        seen_axis_names: set[str] = set(axis_kind)
+        # --- Carrier-import axes (additive; orthogonal to tech axes) ---
         # Group/lump names must be a fresh label, not an existing tech OR
         # carrier name (the polytope name_list shares one namespace).
         reserved_names = all_techs_set | all_carriers_set
-
-        # --- Carrier-import axes (additive; orthogonal to tech axes) ---
-        for name, members in _parse_axis_entries(
+        carrier_groups = _parse_axis_entries(
             include_carrier_list,
             valid_members=all_carriers_set,
             group_name_reserved=reserved_names,
-            seen_axis_names=seen_axis_names,
+            seen_axis_names={name for name, _ in z_groups},
             label="include_carrier_imports",
             member_noun="carrier",
             member_noun_plural="carriers",
-        ):
-            z_groups.append((name, members))
-            axis_kind[name] = "carrier_import"
-
-        self.z_groups: list[tuple[str, list[str]]] = z_groups
-        self.axis_kind: dict[str, str] = axis_kind
-        self.z_names: list[str] = [name for name, _ in z_groups]
-        self._members_by_name: dict[str, list[str]] = {n: m for n, m in z_groups}
-        # Flat list of all tech-axis member techs (for the vectorised
-        # singleton projection path). Carrier members excluded.
-        self.z_techs: list[str] = [
-            m for name, members in z_groups
-            if axis_kind[name] == "tech_capacity" for m in members
-        ]
-        self.n_z: int = len(self.z_groups)
-        self.has_carrier_axis: bool = any(
-            k == "carrier_import" for k in axis_kind.values()
         )
-        # True iff the per-axis dim cannot be "set_technologies": any tech lump,
-        # any tech-axis name not in set_technologies, OR any carrier axis.
-        # Drives the proj-eq dim-name choice in setup_projection_model
-        # (set_technologies when False, else mga_z_axis).
-        self._has_lumped_groups: bool = self.has_carrier_axis or any(
-            len(members) > 1 or name not in all_techs_set
+
+        # self.axes is the SINGLE source of truth for axis ordering everywhere
+        # downstream (z, mu, name_list): tech axes first, then carrier axes.
+        # The capacity type per tech axis is computed here (storage fix: every
+        # member must share the same selected type, see
+        # _compute_axis_capacity_type).
+        self.axes: list[Axis] = [
+            Axis(name, TECH_CAPACITY, tuple(members),
+                 self._compute_axis_capacity_type(name, members))
             for name, members in z_groups
-            if axis_kind[name] == "tech_capacity"
+        ] + [
+            Axis(name, CARRIER_IMPORT, tuple(members), None)
+            for name, members in carrier_groups
+        ]
+        self.z_names: list[str] = [a.name for a in self.axes]
+        self.n_z: int = len(self.axes)
+        self.has_carrier_axis: bool = any(
+            a.kind == CARRIER_IMPORT for a in self.axes
         )
-
-        # Storage fix: every member of a tech axis must share the same
-        # selected capacity type (see _validate_axis_capacity_types).
-        self._axis_capacity_type = self._validate_axis_capacity_types()
 
         # Model handles for carrier-import axes (looked up once).
         if self.has_carrier_axis:
@@ -325,7 +348,7 @@ class MGA:
         # Baseline design vector z*, captured NOW while the baseline solution is
         # still loaded (the fmax LPs overwrite it). Per-axis, kind-aware.
         self._z_star_design_raw = np.array(
-            [self._axis_value(name) for name in self.z_names], dtype=float
+            [self._axis_value(a) for a in self.axes], dtype=float
         )
 
         # Iteration counter for labelling Postprocess folders.
@@ -432,85 +455,80 @@ class MGA:
         )
         return keep.astype(float)
 
-    def _validate_axis_capacity_types(self) -> dict[str, str]:
-        """Enforce per-tech-axis capacity-type homogeneity (storage fix).
+    def _compute_axis_capacity_type(self, name: str, members: list[str]) -> str:
+        """Selected capacity type of one tech axis (storage fix).
 
         After the capacity-type mask, each tech axis aggregates ONE capacity
         quantity per member: energy for storage techs, power otherwise. A
         lumped tech axis mixing storage (energy/GWh) with non-storage
-        (power/GW) members would re-introduce unit mixing, so every member of
-        a tech axis must share the same selected capacity type(s). Returns the
-        selected type per tech axis (for the polytope metadata).
+        (power/GW) members would re-introduce unit mixing, so every member
+        must share the same selected capacity type(s). Returns the "+"-joined
+        selected type (for the polytope metadata).
         """
-        axis_capacity_type: dict[str, str] = {}
-        for name, members in self.z_groups:
-            if self.axis_kind[name] != "tech_capacity":
-                continue
-            sigs = {
-                m: tuple(
-                    str(c)
-                    for c in self._cap_keep.coords["set_capacity_types"].values
-                    if float(self._cap_keep.sel(set_technologies=m,
-                                                set_capacity_types=c)) > 0.5
-                )
-                for m in members
-            }
-            distinct = set(sigs.values())
-            if len(distinct) > 1:
-                raise ValueError(
-                    f"MGA tech axis {name!r}: members map to different capacity "
-                    f"types {sigs}. Lumping storage (energy) with non-storage "
-                    f"(power) techs mixes incommensurable units (GWh vs GW); "
-                    f"split them into separate axes."
-                )
-            sig = next(iter(distinct))
-            if not sig:
-                raise RuntimeError(
-                    f"MGA tech axis {name!r}: no active capacity type for "
-                    f"members {members}; cannot form an axis."
-                )
-            axis_capacity_type[name] = "+".join(sig)
-        return axis_capacity_type
+        sigs = {
+            m: tuple(
+                str(c)
+                for c in self._cap_keep.coords["set_capacity_types"].values
+                if float(self._cap_keep.sel(set_technologies=m,
+                                            set_capacity_types=c)) > 0.5
+            )
+            for m in members
+        }
+        distinct = set(sigs.values())
+        if len(distinct) > 1:
+            raise ValueError(
+                f"MGA tech axis {name!r}: members map to different capacity "
+                f"types {sigs}. Lumping storage (energy) with non-storage "
+                f"(power) techs mixes incommensurable units (GWh vs GW); "
+                f"split them into separate axes."
+            )
+        sig = next(iter(distinct))
+        if not sig:
+            raise RuntimeError(
+                f"MGA tech axis {name!r}: no active capacity type for "
+                f"members {members}; cannot form an axis."
+            )
+        return "+".join(sig)
 
-    def _axis_linexpr(self, name: str):
+    def _axis_linexpr(self, axis: Axis):
         """linopy LinearExpression for one axis (fmax LP objective / projection).
 
         Branches on axis kind (the ONLY place, besides _axis_value, that does):
-          tech_capacity  -> sum of capacity_addition over the axis's member
+          TECH_CAPACITY  -> sum of capacity_addition over the axis's member
                             techs and over (cap_type, loc, year), restricted by
                             _cap_keep to the selected capacity type per tech
                             (energy for storage techs, power otherwise).
-          carrier_import -> duration-weighted sum of flow_import over the axis's
+          CARRIER_IMPORT -> duration-weighted sum of flow_import over the axis's
                             member carriers, nodes, and operational time steps:
                             sum_{m,n,t} tau_t * flow_import[m, n, t].
         """
-        members = self._members_by_name[name]
-        if self.axis_kind[name] == "tech_capacity":
+        members = list(axis.members)
+        if axis.kind == TECH_CAPACITY:
             return (
                 (self._cap_keep * self.cap_add)
                 .sel(set_technologies=members)
                 .sum(self._TECH_AGG + ["set_technologies"])
             )
-        # carrier_import
+        # CARRIER_IMPORT
         return (
             (self._ts_duration * self.flow_import.sel(set_carriers=members))
             .sum(self._CARRIER_AGG)
         )
 
-    def _axis_value(self, name: str) -> float:
+    def _axis_value(self, axis: Axis) -> float:
         """Scalar value of one axis on the currently loaded solution.
 
         Same expression as _axis_linexpr but evaluated on `.solution`; used for
         the frozen baseline z* and for _extract_z after each projection solve.
         """
-        members = self._members_by_name[name]
-        if self.axis_kind[name] == "tech_capacity":
+        members = list(axis.members)
+        if axis.kind == TECH_CAPACITY:
             return float(
                 (self._cap_keep * self.cap_add.solution)
                 .sel(set_technologies=members)
                 .sum(self._TECH_AGG + ["set_technologies"])
             )
-        # carrier_import
+        # CARRIER_IMPORT
         return float(
             (self._ts_duration * self.flow_import.solution.sel(set_carriers=members))
             .sum(self._CARRIER_AGG)
@@ -537,13 +555,12 @@ class MGA:
     def _extract_z(self) -> np.ndarray:
         """Read the exploration vector z from the most recent solve.
 
-        Returns a 1D ndarray of length n_explore in the canonical z_groups
-        order (cost appended last when include_cost), in normalised
-        coordinates. Each design entry is its axis value (kind-aware, see
-        _axis_value).
+        Returns a 1D ndarray of length n_explore in the canonical axes order
+        (cost appended last when include_cost), in normalised coordinates.
+        Each design entry is its axis value (kind-aware, see _axis_value).
         """
         z_design_raw = np.array(
-            [self._axis_value(name) for name in self.z_names], dtype=float
+            [self._axis_value(a) for a in self.axes], dtype=float
         )
         c_raw = None
         if self.include_cost:
@@ -566,7 +583,7 @@ class MGA:
         'capacity_type', 'carrier'), or None."""
         return next((lvl for lvl in index.names if needle in lvl), None)
 
-    def _axis_physical_unit(self, name: str):
+    def _axis_physical_unit(self, axis: Axis):
         """Original physical unit string of the axis VALUE, read from the
         model's unit handling (same source as var_dict.h5's *_units). None
         when unit tracking is off (solver.check_unit_consistency=False) or
@@ -581,14 +598,14 @@ class MGA:
         Heterogeneous lumps yield a ' + '-joined string.
         """
         units = self.optimization_setup.variables.units
-        if self.axis_kind[name] == "tech_capacity":
+        members = list(axis.members)
+        if axis.kind == TECH_CAPACITY:
             ser = units.get("capacity_addition")
             if ser is None:
                 return None
-            members = self._members_by_name[name]
-            selected = self._axis_capacity_type[name].split("+")
-            tech_lvl = self._find_level(ser.index, "technolog")
-            ct_lvl = self._find_level(ser.index, "capacity_type")
+            selected = axis.capacity_type.split("+")
+            tech_lvl = self._find_level(ser.index, _LEVEL_TECH)
+            ct_lvl = self._find_level(ser.index, _LEVEL_CAPACITY_TYPE)
             if tech_lvl is None or ct_lvl is None:
                 return None
             mask = (
@@ -597,12 +614,11 @@ class MGA:
             )
             vals = sorted({str(u) for u in ser[mask].to_numpy()})
             return " + ".join(vals) if vals else None
-        # carrier_import: annualise the instantaneous flow unit (× hour).
+        # CARRIER_IMPORT: annualise the instantaneous flow unit (× hour).
         ser = units.get("flow_import")
         if ser is None:
             return None
-        members = self._members_by_name[name]
-        carrier_lvl = self._find_level(ser.index, "carrier")
+        carrier_lvl = self._find_level(ser.index, _LEVEL_CARRIER)
         if carrier_lvl is None:
             return None
         mask = ser.index.get_level_values(carrier_lvl).isin(members)
@@ -635,19 +651,16 @@ class MGA:
         repackaging of (u_star, c_star, epsilon):
             u_tilde = [u_star..., eps*C*],  offset = [0..., C*]
         """
-        axes = []
-        for name in self.z_names:
-            kind = self.axis_kind[name]
-            axes.append({
-                "name": name,
-                "kind": kind,
-                "members": list(self._members_by_name[name]),
-                "capacity_type": (
-                    self._axis_capacity_type.get(name)
-                    if kind == "tech_capacity" else None
-                ),
-                "unit": self._axis_physical_unit(name),
-            })
+        axes = [
+            {
+                "name": a.name,
+                "kind": a.kind,
+                "members": list(a.members),
+                "capacity_type": a.capacity_type,
+                "unit": self._axis_physical_unit(a),
+            }
+            for a in self.axes
+        ]
         return {
             "axes": axes,
             "cost_axis": "net_present_cost" if self.include_cost else None,
@@ -677,44 +690,46 @@ class MGA:
         """
         # --- LP loop: maximise every axis over the near-optimal space ---
         u_values: dict[str, float] = {}
-        for name in self.z_names:
-            members = self._members_by_name[name]
-            kind = self.axis_kind[name]
-            obj = self._axis_linexpr(name)
+        for axis in self.axes:
+            members = list(axis.members)
+            obj = self._axis_linexpr(axis)
             self.model.add_objective(obj, sense="max", overwrite=True)
             t0 = time.time()
             self.optimization_setup.solve()
             elapsed = time.time() - t0
             if not self.optimization_setup.optimality:
                 raise RuntimeError(
-                    f"MGA oracle fmax: LP for axis {name!r} ({kind}, members "
-                    f"{members}) did not solve to optimality (termination = "
-                    f"{self.model.termination_condition!r}). An 'unbounded' "
-                    f"status means this axis has no finite near-optimal "
-                    f"maximum — exclude the offending member."
+                    f"MGA oracle fmax: LP for axis {axis.name!r} ({axis.kind}, "
+                    f"members {members}) did not solve to optimality "
+                    f"(termination = {self.model.termination_condition!r}). An "
+                    f"'unbounded' status means this axis has no finite "
+                    f"near-optimal maximum — exclude the offending member."
                 )
             # Persist the full extreme near-optimal design for this axis using
             # the same Postprocess machinery as the per-iteration solves.
-            self._postprocess(f"fmax_{name}")
-            u_i = self._axis_value(name)
-            u_values[name] = u_i
+            self._postprocess(f"fmax_{axis.name}")
+            u_i = self._axis_value(axis)
+            # Fail fast: a zero/negative U_g* cannot serve as a normalisation
+            # denominator, and waiting for the remaining LPs wastes a run.
+            if not np.isfinite(u_i) or u_i <= 0:
+                key = ("include_carrier_imports" if axis.kind == CARRIER_IMPORT
+                       else "include_techs / exclude_techs")
+                raise RuntimeError(
+                    f"MGA oracle fmax: U*[{axis.name}] = {u_i:.6g} "
+                    f"({axis.kind}, members {members}) — cannot normalise. "
+                    f"Remove this axis (or the offending member) via "
+                    f"plugins.mga.{key}."
+                )
+            u_values[axis.name] = u_i
             logging.info(
-                f"MGA oracle fmax: U*[{name}] = {u_i:.6g} ({kind}, LP took "
-                f"{elapsed:.1f} s, {len(members)} "
+                f"MGA oracle fmax: U*[{axis.name}] = {u_i:.6g} ({axis.kind}, "
+                f"LP took {elapsed:.1f} s, {len(members)} "
                 f"member{'s' if len(members) != 1 else ''}; full design saved)."
             )
 
         self.u_star = np.array(
             [u_values[n] for n in self.z_names], dtype=float
         )
-
-        # A zero/negative U_g* cannot serve as a normalisation denominator.
-        if (self.u_star <= 0).any():
-            i = int(np.argmin(self.u_star))
-            raise RuntimeError(
-                f"MGA oracle fmax: U*[{self.z_names[i]}] = {self.u_star[i]:.6g} "
-                f"<= 0 — cannot normalise. Exclude this axis or its members."
-            )
 
         # Augmented scale/offset: design axes use U_i* with offset 0; the cost
         # axis (when include_cost) uses the slack range eps*C* with offset C*.
@@ -734,7 +749,7 @@ class MGA:
         )
 
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
-        """Construct (A0, b0) for the initial outer polytope, in z_groups order.
+        """Construct (A0, b0) for the initial outer polytope, in axes order.
 
         Row blocks (n_z axes; bounds come solely from the fmax maxima U_i*):
           1. n_z non-negativity rows  -z_i <= 0  (every axis value is a sum of
@@ -797,7 +812,7 @@ class MGA:
 
         # --- Diagnostic logging ---
         n_cost_rows = 2 if self.include_cost else 0
-        n_tech = sum(1 for k in self.axis_kind.values() if k == "tech_capacity")
+        n_tech = sum(1 for a in self.axes if a.kind == TECH_CAPACITY)
         n_carrier = self.n_z - n_tech
         logging.info(
             f"MGA outer approximation [include_cost={self.include_cost}]: "
@@ -841,34 +856,23 @@ class MGA:
     def setup_projection_model(self) -> None:
         """Add the L-infinity projection model to the linopy model.
 
-        The per-axis dim self._z_dim is ``set_technologies`` when every z-axis
-        is a singleton tech (the proven vectorised path) and ``mga_z_axis``
-        otherwise — lumped/carrier names are not valid coord values on
-        cap_add's ``set_technologies`` dim.
-
-        Projection-equality construction branches:
-          - No carrier axis: ONE vectorised constraint mga_oracle_proj_eq
-            (Sx - delta == trial), Sx built from cap_add via a selector matrix
-            (tech lumps) or a plain .sel (pure singletons).
-          - Any carrier axis: capacity_addition and flow_import cannot share a
-            single vectorised selector, so one named scalar equality PER axis,
-            mga_oracle_proj_eq_axis{i}, with the kind-aware _axis_linexpr.
-            delta stays a vector for the (vectorised) t-constraints.
+        One scalar projection equality per axis, mga_oracle_proj_eq_axis{i}:
+        axis_expr_i - delta[i] == trial_i, with the kind-aware _axis_linexpr.
+        The RHS is updated per iteration in find_nearest_point. delta is a
+        vector on the Z_DIM dim so the t-constraints stay vectorised.
 
         Coordinates are ALWAYS normalised: d_scale_g = 1/U_g* in the t-bounds,
         so min t = max_g |delta_g|/U_g* = the normalised L-inf distance.
-        Variables: mga_oracle_delta (vector on _z_dim), mga_oracle_t (scalar),
+        Variables: mga_oracle_delta (vector on Z_DIM), mga_oracle_t (scalar),
         and mga_oracle_delta_cost (scalar, include_cost only; shares t_var,
         c_scale = 1/(eps*C*)).
 
         Call exactly once before the ORACLE loop.
         """
-        self._z_dim = "mga_z_axis" if self._has_lumped_groups else "set_technologies"
-
         z_coord = xr.DataArray(
             np.array(self.z_names),
-            dims=self._z_dim,
-            coords={self._z_dim: self.z_names},
+            dims=Z_DIM,
+            coords={Z_DIM: self.z_names},
         )
 
         self.delta = self.model.add_variables(
@@ -889,64 +893,22 @@ class MGA:
             lower=0.0,
         )
 
-        if self.has_carrier_axis:
-            # --- Per-axis named equality constraints (mixed variable kinds) ---
-            # One scalar constraint per axis: axis_expr_i - delta[i] == trial_i.
-            # RHS updated per iteration in find_nearest_point.
-            for i, name in enumerate(self.z_names):
-                expr = self._axis_linexpr(name)
-                self.model.add_constraints(
-                    expr - self.delta.sel({self._z_dim: name}) == 0.0,
-                    name=f"mga_oracle_proj_eq_axis{i}",
-                )
-        else:
-            # --- Vectorised path (tech-only; proven, byte-identical) ---
-            if self._has_lumped_groups:
-                # 2-D selector matrix: 1.0 at (member_tech, axis_name) for each
-                # group's members. Multiplying by cap_add and summing reduces it
-                # to a LinearExpr on mga_z_axis, one entry per axis.
-                all_techs = list(self.cap_add.coords["set_technologies"].values)
-                selector = xr.DataArray(
-                    np.zeros((len(all_techs), self.n_z)),
-                    dims=("set_technologies", self._z_dim),
-                    coords={"set_technologies": all_techs,
-                            self._z_dim: self.z_names},
-                )
-                for _g_idx, (name, members) in enumerate(self.z_groups):
-                    for m in members:
-                        selector.loc[
-                            {"set_technologies": m, self._z_dim: name}
-                        ] = 1.0
-                # _cap_keep restricts each tech to its selected capacity type
-                # (energy for storage, power otherwise) — same as _axis_linexpr.
-                Sx = (self._cap_keep * selector * self.cap_add).sum(
-                    ["set_technologies", "set_capacity_types",
-                     "set_location", "set_time_steps_yearly"]
-                )
-            else:
-                # Pure singletons: dim IS set_technologies, byte-identical
-                # except for the _cap_keep capacity-type restriction.
-                Sx = (self._cap_keep * self.cap_add).sel(
-                    set_technologies=self.z_techs
-                ).sum(
-                    ["set_capacity_types", "set_location", "set_time_steps_yearly"]
-                )
-            zero_trial = xr.DataArray(
-                np.zeros(self.n_z),
-                dims=self._z_dim,
-                coords={self._z_dim: self.z_names},
-            )
+        # One scalar projection equality per axis; the RHS (trial point) is
+        # updated each iteration in find_nearest_point.
+        for i, axis in enumerate(self.axes):
+            expr = self._axis_linexpr(axis)
             self.model.add_constraints(
-                Sx - self.delta == zero_trial, name="mga_oracle_proj_eq"
+                expr - self.delta.sel({Z_DIM: axis.name}) == 0.0,
+                name=f"mga_oracle_proj_eq_axis{i}",
             )
 
         # Per-axis L-inf scaling: d_scale_g = 1/U_g* (normalisation always on),
         # so min t yields t* = max_g |delta_g|/U_g* = the normalised L-inf
-        # distance. Vectorised over the whole delta vector in both paths.
+        # distance. Vectorised over the whole delta vector.
         d_scale = xr.DataArray(
             1.0 / self.u_star,
-            dims=self._z_dim,
-            coords={self._z_dim: self.z_names},
+            dims=Z_DIM,
+            coords={Z_DIM: self.z_names},
         )
         self.model.add_constraints(
             d_scale * self.delta - self.t_var <= 0, name="mga_oracle_t_pos"
@@ -987,9 +949,7 @@ class MGA:
 
         logging.info(
             f"MGA oracle: projection model added (n_z = {self.n_z} axes on "
-            f"dim {self._z_dim!r}, proj-eq path = "
-            f"{'per-axis' if self.has_carrier_axis else 'vectorised'}, "
-            f"include_cost = {self.include_cost})"
+            f"dim {Z_DIM!r}, include_cost = {self.include_cost})"
         )
 
     def find_nearest_point(self, trial_point: np.ndarray):
@@ -1018,19 +978,10 @@ class MGA:
         # --- Design axes: trial point -> raw coordinates, set proj-eq RHS ---
         # trial_design_raw = trial_norm * U_g* (the design offset is 0).
         trial_design_raw = trial_point[:self.n_z] * self.u_star
-        if self.has_carrier_axis:
-            # Per-axis named scalar equality: set each RHS to its raw trial value.
-            for i in range(self.n_z):
-                self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].rhs = float(
-                    trial_design_raw[i]
-                )
-        else:
-            trial_da = xr.DataArray(
-                trial_design_raw,
-                dims=self._z_dim,
-                coords={self._z_dim: self.z_names},
+        for i in range(self.n_z):
+            self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].rhs = float(
+                trial_design_raw[i]
             )
-            self.model.constraints["mga_oracle_proj_eq"].rhs = trial_da
 
         # --- Cost axis: trial point -> raw cost, set cost proj-eq RHS ---
         if self.include_cost:
@@ -1063,24 +1014,17 @@ class MGA:
         # --- Cutting hyperplane: dual of the projection equality, rescaled ---
         # mu_raw = dual of the raw proj eq (sign convention matches scipy
         # linprog eqlin.marginals). mu_norm = mu_raw o U_g*.
-        if self.has_carrier_axis:
-            mu_design_raw = np.array(
-                [
-                    float(
-                        self.model.constraints[f"mga_oracle_proj_eq_axis{i}"]
-                        .dual.values
-                    )
-                    for i in range(self.n_z)
-                ],
-                dtype=float,
-            )
-        else:
-            mu_design_raw = (
-                self.model.constraints["mga_oracle_proj_eq"].dual
-                .sel({self._z_dim: self.z_names})
-                .values
-            )
-        mu_cut = np.asarray(mu_design_raw, dtype=float) * self.u_star
+        mu_design_raw = np.array(
+            [
+                float(
+                    self.model.constraints[f"mga_oracle_proj_eq_axis{i}"]
+                    .dual.values
+                )
+                for i in range(self.n_z)
+            ],
+            dtype=float,
+        )
+        mu_cut = mu_design_raw * self.u_star
 
         if self.include_cost:
             mu_c_raw = float(
@@ -1110,31 +1054,28 @@ class MGA:
 # ----------------------------------------------------------------------
 
 @EventPublisher.register(Event.after_solve)
-def run_mga(*args, **kwargs):
-    """Entry point invoked by EventPublisher after the baseline solve."""
+def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
+            scenario_name, param_map):
+    """Entry point invoked by EventPublisher after the baseline solve.
+
+    Returns the oracle summary directory (oracle mode) or None.
+    """
     mode = config.get("mode", "weights")
     epsilon = config["epsilon"]
     exclude_techs = config.get("exclude_techs", [])
     include_techs = config.get("include_techs", [])
     include_carrier_imports = config.get("include_carrier_imports", [])
 
-    # Oracle exploration-coordinate options. ORACLE always normalises by the
-    # per-axis fmax maxima — there is no normalization knob.
+    # Oracle options (ORACLE always normalises by the per-axis fmax maxima).
     ora_cfg = config.get("oracle", {})
     include_cost = bool(ora_cfg.get("include_cost", False))
-    if "normalization" in ora_cfg:
-        logging.info(
-            "MGA oracle: the 'normalization' config key is deprecated and "
-            "ignored — normalization is always on for ORACLE."
-        )
 
-    optimization_setup = kwargs["optimization_setup"]
     postprocess_ctx = {
-        "scenarios": kwargs["scenarios"],
-        "subfolder": kwargs["subfolder"],
-        "model_name": kwargs["model_name"],
-        "scenario_name": kwargs["scenario_name"],
-        "param_map": kwargs["param_map"],
+        "scenarios": scenarios,
+        "subfolder": subfolder,
+        "model_name": model_name,
+        "scenario_name": scenario_name,
+        "param_map": param_map,
     }
     logging.info(
         f"MGA plugin: mode = {mode!r}, epsilon = {epsilon}, "
@@ -1151,20 +1092,22 @@ def run_mga(*args, **kwargs):
     )
     mga.setup()
 
+    result = None
     if mode == "weights":
         iterations = config.get("iterations", [])
         if not iterations:
             logging.warning("MGA plugin: weights mode but no iterations configured; skipping.")
-            return
+            return None
         _run_weights_mode(mga, iterations)
     elif mode == "oracle":
-        _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx)
+        result = _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx)
     else:
         raise ValueError(
             f"Unknown MGA mode: {mode!r}. Expected 'weights' or 'oracle'."
         )
 
     logging.info("MGA plugin: complete.")
+    return result
 
 
 def _run_weights_mode(mga, iterations):
@@ -1230,12 +1173,14 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
     # solver_io="python":  use Gurobi's Python API directly (no LP file IO).
     # manage_env=True:     create+release Gurobi env in the constructor;
     #                      protects single-use academic licenses from hanging.
-    # OutputFlag=1:        show per-MILP Gurobi log output.
+    # Access-time .get: the plugin loader's shallow merge replaces the whole
+    # "oracle" dict, so defaults cannot live in the module-level config.
+    milp_options = ora_cfg.get("milp_options", DEFAULT_MILP_OPTIONS)
     pyomo_solver = pyo.SolverFactory(
         "gurobi", solver_io="python", manage_env=True
     )
     pyomo_solver.set_options(
-        "OutputFlag=1 MIPGap=0.05 MIPGapAbs=0.001 TimeLimit=1800 Threads=10"
+        " ".join(f"{k}={v}" for k, v in milp_options.items())
     )
 
     algo = ORACLEAlgorithm(
@@ -1268,6 +1213,7 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
     finally:
         # Persist artifacts even if refine_approximations raised mid-way.
         _save_polytope_artifacts(mga, poly, df, tol, out)
+    return out
 
 
 def _save_polytope_artifacts(mga, poly, df, tol, out):
@@ -1286,42 +1232,34 @@ def _save_polytope_artifacts(mga, poly, df, tol, out):
         n_iters_done = 0
         converged = False
 
-    # Self-sufficient polytope file: A, b, X, name_list PLUS everything
-    # needed to de-normalise/interpret it (previously living in the now
-    # removed fmax cache and config.json). u_tilde/offset are NOT stored
-    # (exact repackaging of u_star, c_star, epsilon — see
-    # MGA.polytope_metadata). Metadata is a JSON string (no pickle).
+    # Self-sufficient polytope file (schema owned by polytope_io): everything
+    # needed to de-normalise/interpret it. u_tilde/offset are NOT stored
+    # (exact repackaging of u_star, c_star, epsilon — see MGA.polytope_metadata).
     meta = mga.polytope_metadata()
-    # Original physical unit strings (from the dataset/model), aligned
-    # 1:1 with name_list (design axes then the cost axis); "" where a
-    # unit is unavailable (e.g. solver.check_unit_consistency=False).
+    # Original physical unit strings, aligned 1:1 with name_list (design axes
+    # then the cost axis); "" where a unit is unavailable.
     unit_by_name = {a["name"]: (a["unit"] or "") for a in meta["axes"]}
     if meta["cost_axis"]:
         unit_by_name[meta["cost_axis"]] = meta["cost_unit"] or ""
-    units_arr = np.array([unit_by_name.get(n, "") for n in poly.name_list])
     # Name the polytope file after the run: the last "_"-token of the
     # output folder (e.g. ".../cb_2050gf_ORACLE_06" -> "polytope_06.npz"),
     # so the file is self-identifying when collected across runs.
     run_id = Path(mga.optimization_setup.analysis.folder_output).name.split("_")[-1]
     poly_file = f"polytope_{run_id}.npz" if run_id else "polytope.npz"
-    np.savez(
-        out / poly_file,
+    save_polytope(out / poly_file, Polytope(
         A=poly.A, b=poly.b, X=poly.X,
-        name_list=np.array(poly.name_list),
-        u_star=mga.u_star,                       # design-axis maxima (z_names order)
-        c_star=float(mga.c_star),                # baseline net_present_cost
+        names=[str(n) for n in poly.name_list],
+        u_star=mga.u_star,
+        c_star=float(mga.c_star),
         epsilon=float(mga.epsilon),
-        cost_axis=np.array(meta["cost_axis"] or ""),  # "" when include_cost is False
-        z_star=mga._z_star_design_raw,           # raw PHYSICAL baseline design
-        units=units_arr,                         # original units, aligned with name_list
-        tolerance=float(tol),                    # ORACLE convergence tolerance (from config)
-        converged=bool(converged),               # final_max_min_distance <= tolerance
-        final_max_min_distance=float(final_dist),  # achieved max distance between the
-                                                 # outer and inner approximations; this is
-                                                 # the effective tolerance when NOT converged
-                                                 # (NaN if the run raised before any result)
-        axis_meta_json=np.array(json.dumps(meta)),
-    )
+        cost_axis=meta["cost_axis"] or "",
+        z_star=mga._z_star_design_raw,
+        units=[unit_by_name.get(str(n), "") for n in poly.name_list],
+        tolerance=float(tol),
+        converged=bool(converged),
+        final_max_min_distance=float(final_dist),
+        meta=meta,
+    ))
     if df is not None:
         df.to_csv(out / "diagnostics.csv", index=False)
         if converged:
