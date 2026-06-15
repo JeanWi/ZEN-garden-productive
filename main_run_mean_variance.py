@@ -65,7 +65,7 @@ def main(task_id: int):
 
     # generate result folder
 
-    results_root = f"./outputs_{time_str}_{dir_extension}"
+    results_root = f"./outputs_{time_str}_{dir_extension}_{str(task_id)}"
     if not os.path.exists(results_root):
         os.makedirs(results_root)
 
