@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from preprocessing.helpers import get_all_runs, ModelApi
+from preprocessing.helpers import get_all_runs, ModelApi, generate_samples
 from zen_garden import run
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
+from zen_garden.plugins.mean_variance_optimization.helpers import *
+
 
 # SETTINGS
 test_dataset = True
@@ -40,105 +42,63 @@ else:
 # Build model
 
 all_runs = get_all_runs(design_path / "data" / design_run)
+
+result_folder = f"./{design_run}_operation/"
+
+if not os.path.exists(result_folder):
+    os.makedirs(result_folder)
+
+with open("./config.json") as f:
+    config = json.load(f)
+config["solver"]["solver_options"]["LogFile"] = f"{result_folder}/solver_operation.log"
+
+with open("./config_operation.json", "w") as f:
+    json.dump(config, f, indent=4)
+
+# Model API
+m_api = ModelApi(config="./config_operation.json", dataset=dataset, folder_output=result_folder)
+m_api.build_model()
+
+# solve full model
+m_api.solve_model()
+
+m_api.fix_design_variables()
+m_api.fix_operational_variables()
+m_api.reconstruct_cost_constraints(row)
+m_api.solve_model()
+
+
+objective = {}
+
 for key, path_to_design_run in all_runs.items():
-
+    objective[key] = []
     # set variables
-    result_folder = f"./{design_run}_operation/{key}"
-    print(result_folder)
 
-    if not os.path.exists(result_folder):
-        os.makedirs(result_folder)
+    # Fix variables
+    m_api.fix_design_variables()
+    m_api.fix_operational_variables()
 
-    with open("./config.json") as f:
-        config = json.load(f)
-    config["solver"]["solver_options"]["LogFile"] = f"{result_folder}/solver_design.log"
-    # config["solver"]["solver_options"]["FeasibilityTol"] = 1e-2
+    # Absolute SD per technology
+    absolute_sd_per_tech = _calculate_absolute_sd(m_api.optimization_setup)
 
-    with open("./config_operation.json", "w") as f:
-        json.dump(config, f, indent=4)
+    # Correlation per technology pair
+    corr_df = calculate_correlation_matrix(m_api.optimization_setup)
 
-    # Model API
-    m_api = ModelApi(config="./config_operation.json", dataset=dataset, folder_output=result_folder)
-    m_api.build_model()
+    # Sample
+    pairs = generate_covariance_pairs(absolute_sd_per_tech, corr_df)
+    sample = generate_samples(pairs, absolute_sd_per_tech, n_samples = 2)
 
-    A_matrix = m_api.optimization_setup.model.constraints.to_matrix()
-    x = m_api.optimization_setup.model.constraints.vars
+    capex_specific = get_capex_specific(m_api.optimization_setup).to_series()
 
-    vlabels = m_api.optimization_setup.model.variables.carbon_emissions_annual.fix()
+    for index, row in sample.iterrows():
 
+        m_api.reconstruct_cost_constraints(row)
 
-    # solve operation
-    m_api.solve_model()
+        m_api.solve_model()
 
-    # Fix all variables
-    m_api.fix_all_variables()
+        total_cost = m_api.optimization_setup.model.objective.value
 
-    # Adapt costs (loop)
-    m_api.solve_model()
-
-    # Fix capacities
-    # m_api.fix_capacities(path_to_design_run)
+        objective[key].append(total_cost)
 
 
-    # Fix all variables
-    # m_api.fix_all_variables()
-
-    # Adapt costs (loop)
-    # m_api.solve_model()
-
-    # Report total cost
-
-
-# optimization_setup = run(
-#     config="./config.json", dataset=dataset, folder_output=result_folder
-# )
-
-# fix capacity expansions
-
-
-# adapt capex parameters
-#
-# # rerun
-# result_folder = f"./outputs_{time_str}_operation"
-#
-# if not os.path.exists(result_folder):
-#     os.makedirs(result_folder)
-#
-# optimization_setup.solver.solver_options["LogFile"] = (
-#     f"{result_folder}/solver_operation.log"
-# )
-# optimization_setup.solver.solver_dir = result_folder
-# optimization_setup.analysis.folder_output = result_folder
-#
-# EventPublisher.trigger(
-#     Event.after_model_construction, optimization_setup=optimization_setup
-# )
-#
-# if optimization_setup.solver.use_scaling:
-#     optimization_setup.scaling.run_scaling()
-# elif (
-#     optimization_setup.solver.analyze_numerics
-#     or optimization_setup.solver.run_diagnostics
-# ):
-#     optimization_setup.scaling.analyze_numerics()
-# # SOLVE THE OPTIMIZATION PROBLEM
-# optimization_setup.solve()
-#
-# if optimization_setup.solver.use_scaling:
-#     optimization_setup.scaling.re_scale()
-#
-# # EVALUATE RESULTS
-# scenarios = {"": {}}
-# subfolder = Path(".")
-# model_name = dataset
-# scenario_name = None
-# param_map = None
-# # write results
-# Postprocess(
-#     optimization_setup,
-#     scenarios=scenarios,
-#     subfolder=subfolder,
-#     model_name=model_name,
-#     scenario_name=scenario_name,
-#     param_map=param_map,
-# )
+pd.DataFrame(objective).to_csv(f"./{design_run}_operation/objective_samples.csv", index=False)
