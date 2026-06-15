@@ -13,6 +13,8 @@ import pandas as pd
 import psutil
 import xarray as xr
 from linopy.expressions import LinearExpression
+from tqdm import tqdm
+import contextlib
 
 import zen_garden.default_config as default_config
 from zen_garden.plugin_system.loader import register_plugins
@@ -676,3 +678,61 @@ class ModelApi:
         for constr in remove:
             self.optimization_setup.model.remove_constraints(constr)
 
+
+
+    def solve_operation_only(self, result_folder, sample):
+
+
+        objective = pd.Series()
+
+        self.optimization_setup.solver.solver_options["Method"] = 0
+        self.optimization_setup.solver.solver_options["NumericFocus"] = 3
+        self.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
+        self.optimization_setup.solver.solver_options["OutputFlag"] = 0
+        self.optimization_setup.solver.keep_files = False
+
+        self.fix_design_variables()
+        self.fix_operational_variables()
+        self.delete_not_required_constraints()
+        self.optimization_setup.solver.solver_options["Method"] = 0
+        self.solve_model(skip_postprocess=True, skip_scaling=True)
+
+        try:
+            self.solve_model(skip_postprocess=True, skip_scaling=True)
+            total_cost = self.optimization_setup.model.objective.value
+        except:
+            total_cost = -1
+
+        objective.loc["validation_baseline"] = total_cost
+
+        for index, row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
+            with open(os.devnull, "w") as fnull:
+                with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
+
+                    self.reconstruct_cost_constraints(row)
+
+                    try:
+                        self.solve_model(skip_postprocess=True, skip_scaling=True)
+                        total_cost = self.optimization_setup.model.objective.value
+                    except:
+                        total_cost = -1
+
+                    objective.loc[index] = total_cost
+
+        objective.to_csv(f"{result_folder}/objective_samples.csv",
+                                           index=False)
+
+def construct_model(weight, task_id, dataset, result_folder):
+    with open("./config.json") as f:
+        config = json.load(f)
+    config["plugins"]["mean_variance_optimization"] = {}
+    config["plugins"]["mean_variance_optimization"]["weighting_factor"] = weight
+    config["plugins"]["mean_variance_optimization"]["include_variances_for"] = "technology_capex"
+    with open(f"./config_quadratic_{str(task_id)}.json", "w") as f:
+        json.dump(config, f, indent=4)
+
+    m_api = ModelApi(config=f"./config_quadratic_{str(task_id)}.json", dataset=dataset, folder_output=result_folder)
+    m_api.build_model()
+    m_api.optimization_setup.solver.solver_options["LogFile"] = f"{result_folder}/solver.log"
+
+    return m_api
