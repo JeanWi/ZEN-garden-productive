@@ -695,7 +695,8 @@ class ModelApi:
 
 
         for variable in remove:
-            self.optimization_setup.model.remove_variables(variable)
+            if variable in self.optimization_setup.model.variables:
+                self.optimization_setup.model.remove_variables(variable)
 
 
 

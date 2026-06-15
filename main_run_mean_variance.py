@@ -43,7 +43,7 @@ def main(task_id: int):
     sample = pd.read_pickle(sample_path)
 
     # SETTINGS
-    run_on = "local" #epse_server, euler, local
+    run_on = "euler" #epse_server, euler, local
     example_dataset = False
     # base = 10e-6
     # weights = [x * base for x in [25, 50, 75, 100]]
