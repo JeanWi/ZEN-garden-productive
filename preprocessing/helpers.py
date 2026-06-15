@@ -672,11 +672,30 @@ class ModelApi:
             "constraint_capacity_energy_to_power_ratio_max",
             "constraint_capacity_factor_transport",
             "constraint_transport_technology_losses_flow",
+            "constraint_flow_storage_spillage"
         ]
 
 
         for constr in remove:
             self.optimization_setup.model.remove_constraints(constr)
+
+        i = 0
+        while f"constraint_capacity_addition_tech_agg{i}" in self.optimization_setup.model.constraints:
+            constr = f"constraint_capacity_addition_tech_agg{i}"
+            self.optimization_setup.model.remove_constraints(constr)
+            i = i + 1
+
+
+
+    def delete_not_required_variables(self):
+
+        remove = [
+            "capacity_addition_tech_agg",
+        ]
+
+
+        for variable in remove:
+            self.optimization_setup.model.remove_variables(variable)
 
 
 
@@ -694,7 +713,16 @@ class ModelApi:
         self.fix_design_variables()
         self.fix_operational_variables()
         self.delete_not_required_constraints()
+        self.delete_not_required_variables()
         self.optimization_setup.solver.solver_options["Method"] = 0
+
+        self.optimization_setup.model.remove_objective()
+        npv_term = self.optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
+
+        objective = npv_term
+        sense = "min"
+        self.optimization_setup.model.add_objective(objective, sense=sense)
+
         self.solve_model(skip_postprocess=True, skip_scaling=True)
 
         try:
@@ -719,7 +747,7 @@ class ModelApi:
 
                     objective.loc[index] = total_cost
 
-        objective.to_csv(f"{result_folder}/objective_samples.csv",
+                    objective.to_csv(f"{result_folder}/objective_samples.csv",
                                            index=False)
 
 def construct_model(weight, task_id, dataset, result_folder):
