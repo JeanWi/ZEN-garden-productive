@@ -1,0 +1,11 @@
+{
+  "euler": {
+    "root_path": "/cluster/home/jwiegner/zen_garden_packages/ZEN-models/"
+  },
+  "epse_server": {
+    "root_path": "/home/jwiegner/ZEN-models/"
+  },
+  "local": {
+    "root_path": "C:/ZenGardenInput/ZEN-models/"
+  }
+}

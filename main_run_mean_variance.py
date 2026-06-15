@@ -1,50 +1,34 @@
-from copyreg import add_extension
-
-import pandas as pd
 from datetime import datetime
-from preprocessing.helpers import check_for_semidefinite
-import json
-import logging
-import os
 from pathlib import Path
+import json
+import os
 
-from zen_garden import run
-from zen_garden.plugin_system.events import EventPublisher, Event
-from zen_garden.postprocess.postprocess import Postprocess
-from zen_garden.utils import StringUtils
-from zen_garden.plugins.mean_variance_optimization.plugin import config as plugin_config
 from preprocessing.helpers import get_all_runs, ModelApi, generate_samples
 from zen_garden.plugins.mean_variance_optimization.helpers import *
 
 
 # SETTINGS
-on_server = False
+run_on = "local" #epse_server, euler, local
 example_dataset = False
 base = 10e-6
 # weights = [x * base for x in [25, 50, 75, 100]]
 weights = [x * base for x in [25]]
 dir_extension = "fixed_cross_terms_1periods_with_operation"
 n_samples = 10
+
 # PATHS
-if on_server:
-    root_path = Path("/home/jwiegner/ZEN-models")
-else:    
-    root_path = Path("C:/ZenGardenInput/ZEN-models")
+# load_settings
+with open('run_settings.json') as json_file:
+    settings = json.load(json_file)
+
+root_path = Path(settings[run_on]['root_path'])
 if example_dataset:
-    if on_server:
-        raise NotImplementedError("Example dataset not available on server.")
-    root_path = Path(r"C:\ZenGardenInput\example_datasets")
-
-    os.chdir(root_path)
     dataset = "8_yearly_variation"
+    os.chdir(root_path)
 else:
-    os.chdir(root_path / "data")
     dataset = "Crystal_Ball"
+    os.chdir(root_path / "data")
 
-# Check for positive semi-definite matrix in input
-# tech_capex_path = root_path / Path("data/Crystal_Ball/mean_variance/technology_capex")
-# correlation = pd.read_csv(tech_capex_path / "correlation.csv", index_col=0)
-# check_for_semidefinite(correlation)
 
 now = datetime.now()
 time_str = now.strftime("%Y%m%d-%H%M%S")
