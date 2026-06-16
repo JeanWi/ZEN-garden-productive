@@ -690,7 +690,7 @@ class ModelApi:
     def delete_not_required_variables(self):
 
         remove = [
-            "capacity_addition_tech_agg",
+            # "capacity_addition_tech_agg",
         ]
 
 
