@@ -365,10 +365,11 @@ class ModelApi:
 
     def _fix_variables(self, variable_names):
         for var in variable_names:
-            variable = self.optimization_setup.model.variables[var]
+            if var in self.optimization_setup.model.variables:
+                variable = self.optimization_setup.model.variables[var]
 
-            variable.lower = variable.solution
-            variable.upper = variable.solution
+                variable.lower = variable.solution
+                variable.upper = variable.solution
 
     def fix_design_variables(self):
         fix_vars = [
@@ -700,7 +701,7 @@ class ModelApi:
 
 
 
-    def solve_operation_only(self, result_folder, sample):
+    def solve_operation_only(self, result_folder, sample, include_variances_for):
 
 
         objective_df = pd.Series()
@@ -711,10 +712,65 @@ class ModelApi:
         self.optimization_setup.solver.solver_options["OutputFlag"] = 0
         self.optimization_setup.solver.keep_files = False
 
-        self.fix_design_variables()
-        self.fix_operational_variables()
-        self.delete_not_required_constraints()
-        self.delete_not_required_variables()
+        if include_variances_for == "technology_capex":
+            keep_constraints = [
+                "constraint_net_present_cost",
+                "constraint_cost_total",
+                "constraint_cost_capex_yearly_total",
+                "constraint_cost_capex_yearly",
+                "constraint_capex_coupling",
+                "constraint_linear_capex",
+                "constraint_storage_technology_capex",
+                "constraint_transport_technology_capex"
+            ]
+
+            keep_variables = [
+                "cost_total",
+                "cost_capex_yearly_total",
+                "cost_opex_yearly_total",
+                "cost_carrier_total",
+                "cost_carbon_emissions_total",
+                "cost_capex_yearly",
+                "cost_capex_overnight",
+                "capacity",
+                "capacity_addition",
+                "capacity_approximation",
+                "capex_approximation",
+                "technology_installation",
+                "net_present_cost",
+                "storage_level"
+            ]
+
+            fix_variables = [
+                "cost_opex_yearly_total",
+                "cost_carrier_total",
+                "cost_carbon_emissions_total",
+                "capacity",
+                "capacity_addition",
+                "capacity_approximation",
+                "technology_installation"
+            ]
+
+
+        self._fix_variables(fix_variables)
+
+        all_constraints = []
+        for constraint in self.optimization_setup.model.constraints:
+            all_constraints.append(constraint)
+        for constraint in all_constraints:
+            if constraint not in keep_constraints:
+                if constraint in self.optimization_setup.model.constraints:
+                    self.optimization_setup.model.remove_constraints(constraint)
+
+        all_variables = []
+        for var in self.optimization_setup.model.variables:
+            all_variables.append(var)
+
+        for var in all_variables:
+            if var not in keep_variables:
+                if var in self.optimization_setup.model.variables:
+                    self.optimization_setup.model.remove_variables(var)
+
         self.optimization_setup.solver.solver_options["Method"] = 0
 
         self.optimization_setup.model.remove_objective()
@@ -748,15 +804,14 @@ class ModelApi:
 
                     objective_df.loc[index] = total_cost
 
-                    objective_df.to_csv(f"{result_folder}/objective_samples.csv",
-                                           index=False)
+                    objective_df.to_csv(f"{result_folder}/objective_samples.csv")
 
-def construct_model(weight, task_id, dataset, result_folder):
+def construct_model(weight, task_id, dataset, result_folder, include_variances_for):
     with open("./config.json") as f:
         config = json.load(f)
     config["plugins"]["mean_variance_optimization"] = {}
     config["plugins"]["mean_variance_optimization"]["weighting_factor"] = weight
-    config["plugins"]["mean_variance_optimization"]["include_variances_for"] = "technology_capex"
+    config["plugins"]["mean_variance_optimization"]["include_variances_for"] = include_variances_for
     with open(f"./config_quadratic_{str(task_id)}.json", "w") as f:
         json.dump(config, f, indent=4)
 
