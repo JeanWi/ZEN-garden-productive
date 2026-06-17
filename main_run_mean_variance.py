@@ -12,8 +12,8 @@ from preprocessing.helpers import ModelApi, construct_model, generate_samples
 
 def get_parameter_grid():
     base = 10e-6
-    # weights = [x * base for x in [0, 25, 50, 75, 100]]
-    weights = [x * base for x in [0, 25]]
+    weights = [x * base for x in [0, 25, 50, 75, 100]]
+    # weights = [x * base for x in [0, 25]]
     return {
         "weights": weights
     }
@@ -88,10 +88,11 @@ def main(task_id: int):
 
 
     # Main run
+    include_variances_for = "technology_capex"
     result_folder = f"{results_root}/lambda_{str(weight)}"
-    m_api = construct_model(weight, task_id, dataset, result_folder)
+    m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
     m_api.solve_model()
-    m_api.solve_operation_only(result_folder, sample)
+    m_api.solve_operation_only(result_folder, sample, include_variances_for)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
