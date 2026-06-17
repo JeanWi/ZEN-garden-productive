@@ -703,7 +703,7 @@ class ModelApi:
     def solve_operation_only(self, result_folder, sample):
 
 
-        objective = pd.Series()
+        objective_df = pd.Series()
 
         self.optimization_setup.solver.solver_options["Method"] = 0
         self.optimization_setup.solver.solver_options["NumericFocus"] = 3
@@ -720,9 +720,9 @@ class ModelApi:
         self.optimization_setup.model.remove_objective()
         npv_term = self.optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
 
-        objective = npv_term
+        objective_function = npv_term
         sense = "min"
-        self.optimization_setup.model.add_objective(objective, sense=sense)
+        self.optimization_setup.model.add_objective(objective_function, sense=sense)
 
         self.solve_model(skip_postprocess=True, skip_scaling=True)
 
@@ -732,7 +732,7 @@ class ModelApi:
         except:
             total_cost = -1
 
-        objective.loc["validation_baseline"] = total_cost
+        objective_df.loc["validation_baseline"] = total_cost
 
         for index, row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
             with open(os.devnull, "w") as fnull:
@@ -746,9 +746,9 @@ class ModelApi:
                     except:
                         total_cost = -1
 
-                    objective.loc[index] = total_cost
+                    objective_df.loc[index] = total_cost
 
-                    objective.to_csv(f"{result_folder}/objective_samples.csv",
+                    objective_df.to_csv(f"{result_folder}/objective_samples.csv",
                                            index=False)
 
 def construct_model(weight, task_id, dataset, result_folder):
