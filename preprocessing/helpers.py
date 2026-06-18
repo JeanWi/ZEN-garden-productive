@@ -25,7 +25,8 @@ from zen_garden.postprocess.postprocess import Postprocess
 from zen_garden.utils import InputDataChecks, ScenarioUtils, StringUtils, setup_logger
 from zen_garden.wrapper.utils import load_results
 from zen_garden.model.element import Element
-from zen_garden.model.component import IndexSet
+from zen_garden.model.technology.technology import Technology
+from zen_garden.model.component import IndexSet, ZenIndex
 from zen_garden.utils import linexpr_from_tuple_np
 import h5py  # type: ignore
 
@@ -699,6 +700,340 @@ class ModelApi:
             if variable in self.optimization_setup.model.variables:
                 self.optimization_setup.model.remove_variables(variable)
 
+    def calculate_net_present_costs(self, cost_total):
+        factor = pd.Series(index=self.optimization_setup.energy_system.set_time_steps_yearly)
+        for year in self.optimization_setup.energy_system.set_time_steps_yearly:
+
+            ### auxiliary calculations
+            if year == self.optimization_setup.energy_system.set_time_steps_yearly_entire_horizon[-1]:
+                interval_between_years = 1
+            else:
+                interval_between_years = self.optimization_setup.system.interval_between_years
+            # economic discount
+            factor[year] = sum(
+                (
+                    (1 / (1 + self.optimization_setup.parameters.discount_rate))
+                    ** (
+                        self.optimization_setup.system.interval_between_years
+                        * (year - self.optimization_setup.energy_system.set_time_steps_yearly[0])
+                        + _intermediate_time_step
+                    )
+                )
+                for _intermediate_time_step in range(0, interval_between_years)
+            )
+
+        net_present_cost = cost_total * factor
+
+        return net_present_cost
+
+    def calculate_cost_total(self, cost_capex_yearly_total, cost_opex_yearly_total, cost_carrier_total, cost_carbon_emissions_total, validation):
+
+        cost_total = cost_capex_yearly_total + cost_opex_yearly_total + cost_carrier_total + cost_carbon_emissions_total
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_total"].solution,
+                cost_total,
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,  # absolute tolerance
+            )
+
+        return cost_total
+
+    def calculate_cost_capex_yearly_total(self, cost_capex_yearly, validation):
+
+        cost_capex_yearly_total = cost_capex_yearly.sum(["set_technologies", "set_capacity_types", "set_location"])
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_capex_yearly_total"].solution,
+                cost_capex_yearly_total,
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,  # absolute tolerance
+            )
+
+        return cost_capex_yearly_total
+
+    def calculate_cost_capex_yearly(self, cost_capex_overnight, validation):
+        ### index sets
+        index_values, index_names = Element.create_custom_set(
+            [
+                "set_technologies",
+                "set_capacity_types",
+                "set_location",
+                "set_time_steps_yearly",
+            ],
+            self.optimization_setup,
+        )
+        index = ZenIndex(index_values, index_names)
+
+        ### masks
+        # not needed
+
+        # Annuity factor
+        dr = self.optimization_setup.parameters.discount_rate
+        lt = self.optimization_setup.parameters.depreciation_time
+
+        if dr != 0:
+            a = ((1 + dr) ** lt * dr) / ((1 + dr) ** lt - 1)
+        else:
+            a = 1 / lt
+
+        lt_range = pd.MultiIndex.from_tuples(
+            [
+                (t, y, py)
+                for t, y in index.get_unique(
+                ["set_technologies", "set_time_steps_yearly"]
+            )
+                for py in list(
+                Technology.get_lifetime_range(
+                    self.optimization_setup, t, y, use_depreciation_time=True
+                )
+            )
+            ]
+        )
+
+        lt_range = pd.Series(index=lt_range, data=-1)
+        lt_range.index.names = [
+            "set_technologies",
+            "set_time_steps_yearly",
+            "set_time_steps_yearly_prev",
+        ]
+        lt_range = (
+            lt_range.to_xarray()
+            .broadcast_like(self.optimization_setup.model.variables["capacity"].lower)
+            .fillna(0)
+        )
+
+        cost_capex_overnight = cost_capex_overnight.rename(
+            {"set_time_steps_yearly": "set_time_steps_yearly_prev"}
+        )
+        cost_capex_overnight = cost_capex_overnight.broadcast_like(lt_range)
+        expr = (lt_range * a * cost_capex_overnight).sum("set_time_steps_yearly_prev")
+
+        cost_capex_yearly = (a * self.optimization_setup.parameters.existing_capex).broadcast_like(expr) - expr
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_capex_yearly"].solution.sum(),
+                cost_capex_yearly.sum(),
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,  # absolute tolerance
+            )
+
+        return cost_capex_yearly
+
+
+    def calculate_cost_capex_overnight(self, sample_row, validation):
+        cost_capex_overnight = xr.full_like(self.optimization_setup.model.variables["cost_capex_overnight"].solution,
+                                            fill_value=np.nan)
+
+
+        # Conversion technologies
+        capacity_approximation = self.optimization_setup.model.variables["capacity_approximation"].solution
+
+        capex_specific_conversion_original = self.capex_specific_conversion.copy()
+        capex_specific_conversion_original = capex_specific_conversion_original.rename(
+            {
+                old: new
+                for old, new in zip(
+                list(capex_specific_conversion_original.dims),
+                [
+                    "set_conversion_technologies",
+                    "set_nodes",
+                    "set_time_steps_yearly",
+                ],
+                strict=False,
+            )
+            }
+        )
+
+        tech_dim = "set_conversion_technologies"
+        location_dim = "set_nodes"
+        techs = capex_specific_conversion_original.coords[tech_dim].values
+        nodes = self.optimization_setup.sets["set_nodes"]
+
+        if validation:
+            delta_xr = 0
+        else:
+            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_conversion_original, tech_dim, location_dim)
+
+        capex_specific_conversion = capex_specific_conversion_original + delta_xr
+        capex_specific_conversion = capex_specific_conversion.broadcast_like(
+            self.optimization_setup.model.variables["capacity_approximation"].lower
+        )
+
+        capex_approximation = capex_specific_conversion * capacity_approximation
+
+
+
+        capex_approximation = capex_approximation.rename(
+                {
+                    "set_conversion_technologies": "set_technologies",
+                    "set_nodes": "set_location",
+                }
+            )
+        capex_approximation = capex_approximation.reindex(
+            set_technologies=cost_capex_overnight.set_technologies,
+            set_location=cost_capex_overnight.set_location
+        )
+
+
+        cost_capex_overnight.loc[{"set_technologies": techs, "set_capacity_types": "power",
+                                  "set_location": nodes}] = capex_approximation.loc[{"set_technologies": techs,
+                                  "set_location": nodes}]
+
+
+        self.optimization_setup.model.variables["cost_capex_overnight"].solution.sel({"set_technologies": techs}).sum()
+        cost_capex_overnight.sel({"set_technologies": techs}).sum()
+
+        # STORAGE TECHNOLOGIES
+        index_values, index_names = Element.create_custom_set(
+            [
+                "set_storage_technologies",
+                "set_capacity_types",
+                "set_nodes",
+                "set_time_steps_yearly",
+            ],
+            self.optimization_setup,
+        )
+
+        ### auxiliary calculations
+        # get all the arrays and coords
+        techs, capacity_types, nodes, times = IndexSet.tuple_to_arr(
+            index_values, index_names, unique=True
+        )
+
+        capex_specific_storage_original = self.capex_specific_storage.copy()
+
+        tech_dim = "set_storage_technologies"
+        location_dim = "set_nodes"
+        nodes = self.optimization_setup.sets["set_nodes"]
+        techs = capex_specific_storage_original.coords[tech_dim].values
+
+        if validation:
+            delta_xr = 0
+        else:
+            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_storage_original, tech_dim, location_dim)
+
+        capex_specific_storage = capex_specific_storage_original + delta_xr
+
+        capex_specific_storage = capex_specific_storage.rename(
+                {
+                    "set_storage_technologies": "set_technologies",
+                    "set_nodes": "set_location",
+                }
+            )
+
+        capacity_storage = self.optimization_setup.model.variables["capacity_addition"].solution.loc[
+                        techs, capacity_types, nodes, times
+                    ]
+
+        cost_capex_overnight_storage = capex_specific_storage.loc[
+                        techs, capacity_types, nodes, times
+                    ] * capacity_storage
+
+        cost_capex_overnight.loc[{"set_technologies": techs,
+                                  "set_location": nodes}] = cost_capex_overnight_storage
+
+        self.optimization_setup.model.variables["cost_capex_overnight"].solution.sel({"set_technologies": techs}).sum()
+        cost_capex_overnight.sel({"set_technologies": techs}).sum()
+
+        # TRANSPORT TECHNOLOGIES
+        index_values, index_list = Element.create_custom_set(
+            ["set_transport_technologies", "set_edges", "set_time_steps_yearly"],
+            self.optimization_setup,
+        )
+
+        # get the coords
+        coords = [
+            self.optimization_setup.parameters.capex_per_distance_transport.coords[
+                "set_transport_technologies"
+            ],
+            self.optimization_setup.parameters.capex_per_distance_transport.coords["set_edges"],
+            self.optimization_setup.parameters.capex_per_distance_transport.coords[
+                "set_time_steps_yearly"
+            ],
+        ]
+
+        ### masks
+        # This mask checks the distance between nodes for the condition
+        mask = np.isinf(self.optimization_setup.parameters.distance).astype(float)
+
+        # This mask ensure we only get constraints where we want them
+        index_arrs = IndexSet.tuple_to_arr(index_values, index_list)
+        global_mask = xr.DataArray(False, coords=coords)
+        global_mask.loc[index_arrs] = True
+
+        capex_specific_transport_original = self.capex_specific_transport.copy()
+        tech_dim = "set_transport_technologies"
+        location_dim = "set_edges"
+        techs = capex_specific_transport_original.coords[tech_dim].values
+        edges = capex_specific_transport_original.coords[location_dim].values
+
+        if validation:
+            delta_xr = 0
+        else:
+            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_transport_original, tech_dim, location_dim)
+
+        capex_specific_transport = capex_specific_transport_original + delta_xr
+
+        capex_specific_transport = capex_specific_transport.rename(
+                {
+                    "set_transport_technologies": "set_technologies",
+                    "set_edges": "set_location",
+                }
+            )
+
+        capacity_addition_term_distance_inf = (
+                mask
+                * self.optimization_setup.model.variables["capacity_addition"].solution.loc[
+                    coords[0], "power", coords[1], coords[2]
+                ]
+        )
+        capacity_addition_term_distance_not_inf = (
+            (1 - mask) * self.optimization_setup.model.variables["capacity_addition"].solution.loc[
+                    coords[0], "power", coords[1], coords[2]
+                ]
+                * capex_specific_transport.loc[coords[0], coords[1]]
+        )
+
+        cost_capex_overnight_transport = capacity_addition_term_distance_not_inf - capacity_addition_term_distance_inf
+
+        cost_capex_overnight_transport = cost_capex_overnight_transport.drop_vars(
+            ["set_technologies", "set_location"],
+        ).rename(
+            {
+                "set_transport_technologies": "set_technologies",
+                "set_edges": "set_location",
+            }
+        )
+
+        cost_capex_overnight.loc[{"set_technologies": techs,
+                                  "set_location": edges, "set_capacity_types": "power"}] = cost_capex_overnight_transport
+
+        if np.any(
+                self.optimization_setup.parameters.distance.loc[coords[0], coords[1]]
+                * self.optimization_setup.parameters.capex_per_distance_transport.loc[coords[0], coords[1]]
+                != 0
+        ):
+            raise Exception("This does not work!!!!")
+
+
+        self.optimization_setup.model.variables["cost_capex_overnight"].solution.sel({"set_technologies": techs}).sum()
+        cost_capex_overnight.sel({"set_technologies": techs}).sum()
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_capex_overnight"].solution,
+                cost_capex_overnight,
+                rtol=1e-5,  # relative tolerance
+                atol=1e-8,  # absolute tolerance
+            )
+
+        return cost_capex_overnight
+
+
 
 
     def solve_operation_only(self, result_folder, sample, include_variances_for):
@@ -706,105 +1041,135 @@ class ModelApi:
 
         objective_df = pd.Series()
 
-        self.optimization_setup.solver.solver_options["Method"] = 0
-        self.optimization_setup.solver.solver_options["NumericFocus"] = 3
-        self.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
-        self.optimization_setup.solver.solver_options["OutputFlag"] = 0
-        self.optimization_setup.solver.keep_files = False
+        validation = True
+        sample_row = None
 
-        if include_variances_for == "technology_capex":
-            keep_constraints = [
-                "constraint_net_present_cost",
-                "constraint_cost_total",
-                "constraint_cost_capex_yearly_total",
-                "constraint_cost_capex_yearly",
-                "constraint_capex_coupling",
-                "constraint_linear_capex",
-                "constraint_storage_technology_capex",
-                "constraint_transport_technology_capex"
-            ]
+        cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
+        cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
+        cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
+        cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
+        cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
+        cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
+        cost_total = self.calculate_cost_total(cost_capex_yearly_total, cost_opex_yearly_total, cost_carrier_total,
+                                               cost_carbon_emissions_total, validation)
+        net_present_cost = self.calculate_net_present_costs(cost_total)
 
-            keep_variables = [
-                "cost_total",
-                "cost_capex_yearly_total",
-                "cost_opex_yearly_total",
-                "cost_carrier_total",
-                "cost_carbon_emissions_total",
-                "cost_capex_yearly",
-                "cost_capex_overnight",
-                "capacity",
-                "capacity_addition",
-                "capacity_approximation",
-                "capex_approximation",
-                "technology_installation",
-                "net_present_cost",
-                "storage_level"
-            ]
-
-            fix_variables = [
-                "cost_opex_yearly_total",
-                "cost_carrier_total",
-                "cost_carbon_emissions_total",
-                "capacity",
-                "capacity_addition",
-                "capacity_approximation",
-                "technology_installation"
-            ]
+        objective_df.loc["validation"] = float(net_present_cost.sum("set_time_steps_yearly"))
 
 
-        self._fix_variables(fix_variables)
+        validation = False
+        for index, sample_row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
+            if include_variances_for == "technology_capex":
+                cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
+                cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
+                cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
+                cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
+                cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
+                cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
+                cost_total = self.calculate_cost_total(cost_capex_yearly_total, cost_opex_yearly_total, cost_carrier_total, cost_carbon_emissions_total, validation)
+                net_present_cost = self.calculate_net_present_costs(cost_total)
 
-        all_constraints = []
-        for constraint in self.optimization_setup.model.constraints:
-            all_constraints.append(constraint)
-        for constraint in all_constraints:
-            if constraint not in keep_constraints:
-                if constraint in self.optimization_setup.model.constraints:
-                    self.optimization_setup.model.remove_constraints(constraint)
+                objective_df.loc[index] = float(net_present_cost.sum("set_time_steps_yearly"))
+        objective_df.to_csv(f"{result_folder}/objective_samples.csv")
 
-        all_variables = []
-        for var in self.optimization_setup.model.variables:
-            all_variables.append(var)
+        # self.optimization_setup.solver.solver_options["Method"] = 0
+        # self.optimization_setup.solver.solver_options["NumericFocus"] = 3
+        # self.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
+        # self.optimization_setup.solver.solver_options["OutputFlag"] = 0
+        # self.optimization_setup.solver.keep_files = False
+        #
+        # if include_variances_for == "technology_capex":
+        #     keep_constraints = [
+        #         # "constraint_net_present_cost",
+        #         # "constraint_cost_total",
+        #         # "constraint_cost_capex_yearly_total",
+        #         # "constraint_cost_capex_yearly",
+        #         # "constraint_capex_coupling",
+        #         "constraint_linear_capex",
+        #         "constraint_storage_technology_capex",
+        #         "constraint_transport_technology_capex"
+        #     ]
+        #
+        #     keep_variables = [
+        #         "cost_total",
+        #         "cost_capex_yearly_total",
+        #         "cost_opex_yearly_total",
+        #         "cost_carrier_total",
+        #         "cost_carbon_emissions_total",
+        #         "cost_capex_yearly",
+        #         "cost_capex_overnight",
+        #         "capacity",
+        #         "capacity_addition",
+        #         "capacity_approximation",
+        #         "capex_approximation",
+        #         "technology_installation",
+        #         "net_present_cost",
+        #         "storage_level"
+        #     ]
+        #
+        #     fix_variables = [
+        #         "cost_opex_yearly_total",
+        #         "cost_carrier_total",
+        #         "cost_carbon_emissions_total",
+        #         "capacity",
+        #         "capacity_addition",
+        #         "capacity_approximation",
+        #         "technology_installation"
+        #     ]
+        #
+        #
+        # self._fix_variables(fix_variables)
+        #
+        # all_constraints = []
+        # for constraint in self.optimization_setup.model.constraints:
+        #     all_constraints.append(constraint)
+        # for constraint in all_constraints:
+        #     if constraint not in keep_constraints:
+        #         if constraint in self.optimization_setup.model.constraints:
+        #             self.optimization_setup.model.remove_constraints(constraint)
+        #
+        # all_variables = []
+        # for var in self.optimization_setup.model.variables:
+        #     all_variables.append(var)
+        #
+        # for var in all_variables:
+        #     if var not in keep_variables:
+        #         if var in self.optimization_setup.model.variables:
+        #             self.optimization_setup.model.remove_variables(var)
+        #
+        # self.optimization_setup.solver.solver_options["Method"] = 0
+        #
+        # self.optimization_setup.model.remove_objective()
+        # npv_term = self.optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
+        #
+        # objective_function = npv_term
+        # sense = "min"
+        # self.optimization_setup.model.add_objective(objective_function, sense=sense)
+        #
+        # self.solve_model(skip_postprocess=True, skip_scaling=True)
+        #
+        # try:
+        #     self.solve_model(skip_postprocess=True, skip_scaling=True)
+        #     total_cost = self.optimization_setup.model.objective.value
+        # except:
+        #     total_cost = -1
+        #
+        # objective_df.loc["validation_baseline"] = total_cost
+        #
+        # for index, row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
+        #     with open(os.devnull, "w") as fnull:
+        #         with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
+        #
+        #             self.reconstruct_cost_constraints(row)
+        #
+        #             try:
+        #                 self.solve_model(skip_postprocess=True, skip_scaling=True)
+        #                 total_cost = self.optimization_setup.model.objective.value
+        #             except:
+        #                 total_cost = -1
+        #
+        #             objective_df.loc[index] = total_cost
 
-        for var in all_variables:
-            if var not in keep_variables:
-                if var in self.optimization_setup.model.variables:
-                    self.optimization_setup.model.remove_variables(var)
-
-        self.optimization_setup.solver.solver_options["Method"] = 0
-
-        self.optimization_setup.model.remove_objective()
-        npv_term = self.optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
-
-        objective_function = npv_term
-        sense = "min"
-        self.optimization_setup.model.add_objective(objective_function, sense=sense)
-
-        self.solve_model(skip_postprocess=True, skip_scaling=True)
-
-        try:
-            self.solve_model(skip_postprocess=True, skip_scaling=True)
-            total_cost = self.optimization_setup.model.objective.value
-        except:
-            total_cost = -1
-
-        objective_df.loc["validation_baseline"] = total_cost
-
-        for index, row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
-            with open(os.devnull, "w") as fnull:
-                with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
-
-                    self.reconstruct_cost_constraints(row)
-
-                    try:
-                        self.solve_model(skip_postprocess=True, skip_scaling=True)
-                        total_cost = self.optimization_setup.model.objective.value
-                    except:
-                        total_cost = -1
-
-                    objective_df.loc[index] = total_cost
-
-                    objective_df.to_csv(f"{result_folder}/objective_samples.csv")
 
 def construct_model(weight, task_id, dataset, result_folder, include_variances_for):
     with open("./config.json") as f:
