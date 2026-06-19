@@ -85,19 +85,20 @@ def main(task_id: int):
     m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
     m_api.solve_model()
     objective_value = float(m_api.optimization_setup.model.variables["net_present_cost"].solution.sum("set_time_steps_yearly"))
-    # m_api.reevaluate_objective(result_folder, sample, include_variances_for)
+    m_api.reevaluate_objective(result_folder, sample, include_variances_for)
 
     # Main run with cost limit
-    results_root = f"./outputs_{time_str}_{dir_extension}_cost_limit"
-    if not os.path.exists(results_root):
-        os.makedirs(results_root)
-    result_folder = f"{results_root}/lambda_{str(weight)}"
+    if weight != 0:
+        results_root = f"./outputs_{time_str}_{dir_extension}_cost_limit"
+        if not os.path.exists(results_root):
+            os.makedirs(results_root)
+        result_folder = f"{results_root}/lambda_{str(weight)}"
 
 
-    config["method"] = "cost_constraint"
-    config["cost_constraint"] = objective_value
-    m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
-    m_api.solve_model()
+        config["method"] = "cost_constraint"
+        config["cost_constraint"] = objective_value
+        m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
+        m_api.solve_model()
 
 
 if __name__ == "__main__":

@@ -9,11 +9,11 @@ config = {
     "method": "weighting_factor", # cost_constraint, weighting_factor
     "weighting_factor": None,
     "cost_constraint": None,
+    "include_correlation": True,
     "include_variances_for": ["technology_capex", "technology_opex", "import", "export", "demand_shedding"],
 }
 
-
-def _only_technology_correlation(optimization_setup, quadratic_term):
+def _technology_correlation(optimization_setup, quadratic_term):
     """Simplified variance term: aggregate capacity additions over locations and time steps,
     and compute correlations only per technology pair (not per location/time).
 
@@ -45,6 +45,8 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
         coords=[agg_index],
     )
 
+    include_correlation = config.get("include_correlation")
+
     # Construct constraints for aggregate variables
     for variable_index, variable_key in tqdm(inverse_index_map.items(), total=len(inverse_index_map),
                        desc="Constructing aggregate variables"):
@@ -70,16 +72,23 @@ def _only_technology_correlation(optimization_setup, quadratic_term):
                        desc="Constructing quadratic variance term (technology correlation)"):
         index_i = covariance_matrix_indexmap[pair[0]]
         index_j = covariance_matrix_indexmap[pair[1]]
-        covariance = covariance_matrix[index_i, index_j]
-
-        C_i = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_i)
-        C_j = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_j)
 
         if index_i != index_j:
             factor = 2
+
+            if include_correlation:
+                covariance = covariance_matrix[index_i, index_j]
+
+                C_i = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_i)
+                C_j = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_j)
+                quadratic_term += factor * covariance * C_i * C_j
         else:
             factor = 1
-        quadratic_term += factor * covariance * C_i * C_j
+            covariance = covariance_matrix[index_i, index_j]
+
+            C_i = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_i)
+            C_j = model.variables["capacity_addition_tech_agg"].sel(agg_index=index_j)
+            quadratic_term += factor * covariance * C_i * C_j
 
     return quadratic_term
 
@@ -143,6 +152,7 @@ def calculate_variance_from_solution(postprocessing=None):
         covariance_rows.append({
             "pair": pair,
             "covariance": covariance * C_i * C_j,
+            "covariance_factor": covariance
         })
 
     plugin_reporting = {}
@@ -170,9 +180,12 @@ def construct_mean_variance_objective(optimization_setup=None):
     variance_term = 0
 
     weighting_factor = config.get("weighting_factor")
+    include_correlation = config.get("include_correlation")
     if weighting_factor:
         if "technology_capex" in config.get("include_variances_for"):
-            variance_term = _only_technology_correlation(optimization_setup, variance_term)
+            variance_term = _technology_correlation(optimization_setup, variance_term)
+
+
 
 
     optimization_setup.model.remove_objective()
