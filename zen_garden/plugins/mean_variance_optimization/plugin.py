@@ -6,10 +6,11 @@ from zen_garden.plugins.mean_variance_optimization.helpers import generate_sum_l
     get_non_zero_elements
 
 config = {
-    "method": "weighting_factor", # cost_constraint, weighting_factor
+    "method": "weighting_factor", # cost_constraint, weighting_factor, regularization_only
     "weighting_factor": None,
     "cost_constraint": None,
     "include_correlation": True,
+    "regularization_factor": 1e-8,
     "include_variances_for": ["technology_capex", "technology_opex", "import", "export", "demand_shedding"],
 }
 
@@ -92,6 +93,12 @@ def _technology_correlation(optimization_setup, quadratic_term):
 
     return quadratic_term
 
+def _create_diagonal_squared_terms(optimization_setup):
+    regularization_term = 0
+    regularization_factor = config.get("regularization_factor")
+    for var in optimization_setup.model.variables:
+        regularization_term += regularization_factor * (optimization_setup.model.variables[var] * optimization_setup.model.variables[var]).sum()
+    return regularization_term
 
 @EventPublisher.register(Event.after_postprocessing)
 def calculate_variance_from_solution(postprocessing=None):
@@ -179,36 +186,37 @@ def calculate_variance_from_solution(postprocessing=None):
 def construct_mean_variance_objective(optimization_setup=None):
     variance_term = 0
 
-    weighting_factor = config.get("weighting_factor")
-    include_correlation = config.get("include_correlation")
-    if weighting_factor:
-        if "technology_capex" in config.get("include_variances_for"):
-            variance_term = _technology_correlation(optimization_setup, variance_term)
-
-
-
 
     optimization_setup.model.remove_objective()
-
     npv_term = optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
-
     method = config.get("method")
 
     if method == "weighting_factor":
         weighting_factor = config.get("weighting_factor")
+        if weighting_factor:
+            if "technology_capex" in config.get("include_variances_for"):
+                variance_term = _technology_correlation(optimization_setup, variance_term)
+
         if weighting_factor is None: weighting_factor = 0
         objective = weighting_factor * variance_term + npv_term
         sense = "min"
         optimization_setup.model.add_objective(objective, sense=sense)
 
-    elif method == "cost_constraint":
-        # objective is variance
-        objective = variance_term
+    # elif method == "cost_constraint":
+    #     # objective is variance
+    #     objective = variance_term
+    #     sense = "min"
+    #     optimization_setup.model.add_objective(objective, sense=sense)
+    #
+    #     # Limit cost
+    #     constraint_cost_objective = npv_term <= config.get("cost_constraint")
+    #     optimization_setup.constraints.add_constraint(
+    #         f"constraint_cost_variance_plugin", constraint_cost_objective
+    #     )
+
+    elif method == "regularization_only":
+        regularization_term = _create_diagonal_squared_terms(optimization_setup)
+        objective = regularization_term + npv_term
         sense = "min"
         optimization_setup.model.add_objective(objective, sense=sense)
 
-        # Limit cost
-        constraint_cost_objective = npv_term <= config.get("cost_constraint")
-        optimization_setup.constraints.add_constraint(
-            f"constraint_cost_variance_plugin", constraint_cost_objective
-        )
