@@ -928,40 +928,76 @@ class ModelApi:
 
 
 
+    def _compute_single_objective(self, sample_row, include_variances_for, validation=False):
+        """Helper method to compute objective for a single sample (for parallelization)."""
+        if include_variances_for == "technology_capex":
+            cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
+            cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
+            cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
+            cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
+            cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
+            cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
+            cost_total = self.calculate_cost_total(
+                cost_capex_yearly_total, 
+                cost_opex_yearly_total, 
+                cost_carrier_total, 
+                cost_carbon_emissions_total, 
+                validation
+            )
+            net_present_cost = self.calculate_net_present_costs(cost_total)
+            return float(net_present_cost.sum("set_time_steps_yearly"))
+        else:
+            raise NotImplementedError(f"Variance type {include_variances_for} not yet supported")
+
     def solve_operation_only(self, result_folder, sample, include_variances_for):
-
-
+        """Solve operation-only problem for multiple samples.
+        
+        Args:
+            result_folder: Path to save results
+            sample: DataFrame with samples
+            include_variances_for: Which variances to include
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import multiprocessing as mp
+        
         objective_df = pd.Series()
 
+        # Validation run
         validation = True
         sample_row = None
+        objective_df.loc["validation"] = self._compute_single_objective(
+            sample_row, include_variances_for, validation
+        )
 
-        cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
-        cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
-        cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
-        cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
-        cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
-        cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
-        cost_total = self.calculate_cost_total(cost_capex_yearly_total, cost_opex_yearly_total, cost_carrier_total,
-                                               cost_carbon_emissions_total, validation)
-        net_present_cost = self.calculate_net_present_costs(cost_total)
-
-        objective_df.loc["validation"] = float(net_present_cost.sum("set_time_steps_yearly"))
-
-
+        # Main sample evaluations
         validation = False
-        for index, sample_row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
-            if include_variances_for == "technology_capex":
-                cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
-                cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
-                cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
-                cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
-                cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
-                cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
-                cost_total = self.calculate_cost_total(cost_capex_yearly_total, cost_opex_yearly_total, cost_carrier_total, cost_carbon_emissions_total, validation)
-                net_present_cost = self.calculate_net_present_costs(cost_total)
 
-                objective_df.loc[index] = float(net_present_cost.sum("set_time_steps_yearly"))
+        n_workers = mp.cpu_count()
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
+            for index, sample_row in sample.iterrows():
+                future = executor.submit(
+                    self._compute_single_objective,
+                    sample_row,
+                    include_variances_for,
+                    validation
+                )
+                futures[future] = index
+
+            for future in tqdm(
+                as_completed(futures.keys()),
+                total=len(sample),
+                desc=f"Reevaluating objective (parallel, {n_workers} workers)"
+            ):
+                index = futures[future]
+                try:
+                    objective_df.loc[index] = future.result()
+                except Exception as e:
+                    print(f"Error processing sample {index}: {e}")
+                    objective_df.loc[index] = None
+        
+        # Save results
         objective_df.to_csv(f"{result_folder}/objective_samples.csv")
 
 def construct_model(weight, task_id, dataset, result_folder, include_variances_for):
