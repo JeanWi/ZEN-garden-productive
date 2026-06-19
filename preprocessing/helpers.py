@@ -364,37 +364,13 @@ class ModelApi:
             )
         logging.info("--- Optimization finished ---")
 
-    def _fix_variables(self, variable_names):
+    def fix_variables(self, variable_names):
         for var in variable_names:
             if var in self.optimization_setup.model.variables:
                 variable = self.optimization_setup.model.variables[var]
 
                 variable.lower = variable.solution
                 variable.upper = variable.solution
-
-    def fix_design_variables(self):
-        fix_vars = [
-            "capacity_addition"
-        ]
-
-        self._fix_variables(fix_vars)
-
-    def fix_operational_variables(self):
-        fix_vars = [
-            "flow_import",
-            "flow_export",
-            "flow_conversion_input",
-            "flow_conversion_output",
-            "flow_storage_charge",
-            "flow_storage_discharge",
-            "flow_transport",
-            "carbon_emissions_technology",
-            "shed_demand",
-            "flow_transport_loss"
-        ]
-
-        self._fix_variables(fix_vars)
-
 
     def reconstruct_cost_constraints(self, sample):
 
@@ -615,90 +591,6 @@ class ModelApi:
 
         self.optimization_setup.model.add_constraints(lhs, "==", rhs, name="constraint_transport_technology_capex")
 
-    def _reconstruct_demand_shedding_constraint(self, allow_demand_shedding):
-
-        self.optimization_setup.model.remove_constraints("constraint_cost_shed_demand")
-        self.optimization_setup.model.remove_constraints("constraint_limit_shed_demand")
-
-        if allow_demand_shedding:
-            # cost of shedding demand
-            lhs_cost = (
-                    self.optimization_setup.model.variables["cost_shed_demand"]
-                    - 100 * self.optimization_setup.model.variables[
-                        "shed_demand"]
-            )
-            rhs_cost = 0
-
-            # limit of shedding demand:
-            #   either the demand (price != inf) or zero (price == inf)
-            lhs_shed_demand = self.optimization_setup.model.variables["shed_demand"]
-            rhs_shed_demand = 1
-
-            print("I am here")
-
-        else:
-            mask = self.optimization_setup.parameters.price_shed_demand != np.inf
-
-            # cost of shedding demand
-            lhs_cost = (
-                self.optimization_setup.model.variables["cost_shed_demand"]
-                - self.optimization_setup.parameters.price_shed_demand * self.optimization_setup.model.variables["shed_demand"]
-            ).where(mask)
-            rhs_cost = 0
-
-            # limit of shedding demand:
-            #   either the demand (price != inf) or zero (price == inf)
-            lhs_shed_demand = self.optimization_setup.model.variables["shed_demand"]
-            rhs_shed_demand = self.optimization_setup.parameters.demand.where(mask, 0.0)
-
-        self.optimization_setup.model.add_constraints(lhs_shed_demand, "<=", rhs_shed_demand, name="constraint_limit_shed_demand")
-        self.optimization_setup.model.add_constraints(lhs_cost, "==", rhs_cost, name="constraint_cost_shed_demand")
-
-    def delete_not_required_constraints(self):
-
-        remove = [
-            "constraint_availability_import",
-            "constraint_availability_export",
-            "constraint_availability_import_yearly",
-            "constraint_availability_export_yearly",
-            "constraint_limit_shed_demand",
-            "constraint_nodal_energy_balance",
-            "constraint_technology_capacity_limit_not_reached",
-            "constraint_technology_capacity_limit_reached",
-            "constraint_capacity_factor_conversion",
-            "constraint_carrier_conversion",
-            "constraint_minimum_full_load_hours",
-            "constraint_capacity_factor_storage",
-            "constraint_storage_level_max",
-            "constraint_capacity_energy_to_power_ratio_min",
-            "constraint_capacity_energy_to_power_ratio_max",
-            "constraint_capacity_factor_transport",
-            "constraint_transport_technology_losses_flow",
-            "constraint_flow_storage_spillage"
-        ]
-
-
-        for constr in remove:
-            self.optimization_setup.model.remove_constraints(constr)
-
-        i = 0
-        while f"constraint_capacity_addition_tech_agg{i}" in self.optimization_setup.model.constraints:
-            constr = f"constraint_capacity_addition_tech_agg{i}"
-            self.optimization_setup.model.remove_constraints(constr)
-            i = i + 1
-
-
-
-    def delete_not_required_variables(self):
-
-        remove = [
-            # "capacity_addition_tech_agg",
-        ]
-
-
-        for variable in remove:
-            if variable in self.optimization_setup.model.variables:
-                self.optimization_setup.model.remove_variables(variable)
 
     def calculate_net_present_costs(self, cost_total):
         factor = pd.Series(index=self.optimization_setup.energy_system.set_time_steps_yearly)
@@ -1071,105 +963,6 @@ class ModelApi:
 
                 objective_df.loc[index] = float(net_present_cost.sum("set_time_steps_yearly"))
         objective_df.to_csv(f"{result_folder}/objective_samples.csv")
-
-        # self.optimization_setup.solver.solver_options["Method"] = 0
-        # self.optimization_setup.solver.solver_options["NumericFocus"] = 3
-        # self.optimization_setup.solver.solver_options["FeasibilityTol"] = 1e-3
-        # self.optimization_setup.solver.solver_options["OutputFlag"] = 0
-        # self.optimization_setup.solver.keep_files = False
-        #
-        # if include_variances_for == "technology_capex":
-        #     keep_constraints = [
-        #         # "constraint_net_present_cost",
-        #         # "constraint_cost_total",
-        #         # "constraint_cost_capex_yearly_total",
-        #         # "constraint_cost_capex_yearly",
-        #         # "constraint_capex_coupling",
-        #         "constraint_linear_capex",
-        #         "constraint_storage_technology_capex",
-        #         "constraint_transport_technology_capex"
-        #     ]
-        #
-        #     keep_variables = [
-        #         "cost_total",
-        #         "cost_capex_yearly_total",
-        #         "cost_opex_yearly_total",
-        #         "cost_carrier_total",
-        #         "cost_carbon_emissions_total",
-        #         "cost_capex_yearly",
-        #         "cost_capex_overnight",
-        #         "capacity",
-        #         "capacity_addition",
-        #         "capacity_approximation",
-        #         "capex_approximation",
-        #         "technology_installation",
-        #         "net_present_cost",
-        #         "storage_level"
-        #     ]
-        #
-        #     fix_variables = [
-        #         "cost_opex_yearly_total",
-        #         "cost_carrier_total",
-        #         "cost_carbon_emissions_total",
-        #         "capacity",
-        #         "capacity_addition",
-        #         "capacity_approximation",
-        #         "technology_installation"
-        #     ]
-        #
-        #
-        # self._fix_variables(fix_variables)
-        #
-        # all_constraints = []
-        # for constraint in self.optimization_setup.model.constraints:
-        #     all_constraints.append(constraint)
-        # for constraint in all_constraints:
-        #     if constraint not in keep_constraints:
-        #         if constraint in self.optimization_setup.model.constraints:
-        #             self.optimization_setup.model.remove_constraints(constraint)
-        #
-        # all_variables = []
-        # for var in self.optimization_setup.model.variables:
-        #     all_variables.append(var)
-        #
-        # for var in all_variables:
-        #     if var not in keep_variables:
-        #         if var in self.optimization_setup.model.variables:
-        #             self.optimization_setup.model.remove_variables(var)
-        #
-        # self.optimization_setup.solver.solver_options["Method"] = 0
-        #
-        # self.optimization_setup.model.remove_objective()
-        # npv_term = self.optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
-        #
-        # objective_function = npv_term
-        # sense = "min"
-        # self.optimization_setup.model.add_objective(objective_function, sense=sense)
-        #
-        # self.solve_model(skip_postprocess=True, skip_scaling=True)
-        #
-        # try:
-        #     self.solve_model(skip_postprocess=True, skip_scaling=True)
-        #     total_cost = self.optimization_setup.model.objective.value
-        # except:
-        #     total_cost = -1
-        #
-        # objective_df.loc["validation_baseline"] = total_cost
-        #
-        # for index, row in tqdm(sample.iterrows(), total=len(sample), desc="Reevaluating objective"):
-        #     with open(os.devnull, "w") as fnull:
-        #         with contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
-        #
-        #             self.reconstruct_cost_constraints(row)
-        #
-        #             try:
-        #                 self.solve_model(skip_postprocess=True, skip_scaling=True)
-        #                 total_cost = self.optimization_setup.model.objective.value
-        #             except:
-        #                 total_cost = -1
-        #
-        #             objective_df.loc[index] = total_cost
-
 
 def construct_model(weight, task_id, dataset, result_folder, include_variances_for):
     with open("./config.json") as f:
