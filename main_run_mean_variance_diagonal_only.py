@@ -12,12 +12,12 @@ from preprocessing.helpers import ModelApi, construct_model, generate_samples
 # SETTINGS
 run_on = "local"  # epse_server, euler, local
 example_dataset = True
-with_diagonal_variance_only = False
+with_diagonal_variance_only = True
 method = "weighting_factor"
 nr_timesteps = 1
 
 def get_parameter_grid():
-    base = 10e-10
+    base = 10e-7
     weights = [x * base for x in [0, 25, 50, 75, 100]]
     # weights = [x * base for x in [0, 25]]
     return {
@@ -79,7 +79,7 @@ def main(task_id: int):
 
 
     # Main run with weighting factor
-    dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_full_covariance_matrix"
+    dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_diagonal_variance_only"
     results_root = f"./outputs_{time_str}_{dir_extension}_weighting_factor"
     if not os.path.exists(results_root):
         os.makedirs(results_root)

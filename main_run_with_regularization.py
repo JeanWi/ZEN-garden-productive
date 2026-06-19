@@ -11,15 +11,15 @@ from preprocessing.helpers import ModelApi, construct_model, generate_samples
 
 # SETTINGS
 run_on = "local"  # epse_server, euler, local
+nr_timesteps = 1
 example_dataset = True
 with_diagonal_variance_only = False
-method = "weighting_factor"
-nr_timesteps = 1
+method = "regularization_only"
+
 
 def get_parameter_grid():
-    base = 10e-10
-    weights = [x * base for x in [0, 25, 50, 75, 100]]
-    # weights = [x * base for x in [0, 25]]
+    base = 1e-10
+    weights = [x * base for x in [1e1, 1e2, 1e3]]
     return {
         "weights": weights
     }
@@ -58,28 +58,9 @@ def main(task_id: int):
         dataset = "Crystal_Ball"
         os.chdir(root_path / "data")
 
-    # generate result folder
-
-    # generate sample
-    # m_api = ModelApi(config="./config.json", dataset=dataset, folder_output=results_root + "/sampling")
-    # m_api.build_model()
-    #
-    # n_samples = 1000
-    # covariance_map, covariance_matrix_upper = generate_covariance_matrix(m_api.optimization_setup)
-    # sparse.save_npz(f"{results_root}/covariance_matrix_upper.npz", covariance_matrix_upper)
-    # mapping_serializable = {
-    #     "|".join(k): v for k, v in covariance_map.items()
-    # }
-    # with open(f"{results_root}/covariance_map.json", "w") as f:
-    #     json.dump(mapping_serializable, f)
-    # sample = generate_samples(covariance_matrix_upper, covariance_map, n_samples=n_samples)
-    # sample.to_pickle(f"./outputs_{time_str}_{dir_extension}/sample.pkl")
-    # sample.to_csv(f"./outputs_{time_str}_{dir_extension}/sample.csv", index=False)
-
-
 
     # Main run with weighting factor
-    dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_full_covariance_matrix"
+    dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_regularization"
     results_root = f"./outputs_{time_str}_{dir_extension}_weighting_factor"
     if not os.path.exists(results_root):
         os.makedirs(results_root)
@@ -87,25 +68,9 @@ def main(task_id: int):
     include_variances_for = "technology_capex"
     result_folder = f"{results_root}/lambda_{str(weight)}"
     config["method"] = method
-    if with_diagonal_variance_only:
-        config["include_correlation"] = False
+    config["regularization_factor"] = weight
     m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
     m_api.solve_model()
-    m_api.reevaluate_objective(result_folder, sample, include_variances_for)
-
-    # Main run with cost limit
-    objective_value = float(m_api.optimization_setup.model.variables["net_present_cost"].solution.sum("set_time_steps_yearly"))
-    # if weight != 0:
-    #     results_root = f"./outputs_{time_str}_{dir_extension}_cost_limit"
-    #     if not os.path.exists(results_root):
-    #         os.makedirs(results_root)
-    #     result_folder = f"{results_root}/lambda_{str(weight)}"
-    #
-    #
-    #     config["method"] = "cost_constraint"
-    #     config["cost_constraint"] = objective_value
-    #     m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
-    #     m_api.solve_model()
 
 
 if __name__ == "__main__":
