@@ -949,7 +949,7 @@ class ModelApi:
         else:
             raise NotImplementedError(f"Variance type {include_variances_for} not yet supported")
 
-    def solve_operation_only(self, result_folder, sample, include_variances_for):
+    def reevaluate_objective(self, result_folder, sample, include_variances_for):
         """Solve operation-only problem for multiple samples.
         
         Args:
@@ -971,7 +971,6 @@ class ModelApi:
 
         # Main sample evaluations
         validation = False
-
         n_workers = mp.cpu_count()
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -991,11 +990,7 @@ class ModelApi:
                 desc=f"Reevaluating objective (parallel, {n_workers} workers)"
             ):
                 index = futures[future]
-                try:
-                    objective_df.loc[index] = future.result()
-                except Exception as e:
-                    print(f"Error processing sample {index}: {e}")
-                    objective_df.loc[index] = None
+                objective_df.loc[index] = future.result()
         
         # Save results
         objective_df.to_csv(f"{result_folder}/objective_samples.csv")

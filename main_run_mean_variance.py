@@ -6,9 +6,8 @@ import pandas as pd
 from scipy import sparse
 import argparse
 
-from zen_garden.plugins.mean_variance_optimization.helpers import generate_covariance_matrix
+from zen_garden.plugins.mean_variance_optimization.plugin import config, construct_mean_variance_objective
 from preprocessing.helpers import ModelApi, construct_model, generate_samples
-
 
 def get_parameter_grid():
     base = 10e-6
@@ -34,21 +33,14 @@ def main(task_id: int):
     now = datetime.now()
     time_str = now.strftime("%Y%m%d-%H%M%S")
 
-    dir_extension = "fixed_cross_terms_1periods_with_operation"
 
     print(f"Running task_id={task_id}, weight={weight}")
-
-
 
     sample = pd.read_pickle(sample_path)
 
     # SETTINGS
     run_on = "euler" #epse_server, euler, local
     example_dataset = False
-    # base = 10e-6
-    # weights = [x * base for x in [25, 50, 75, 100]]
-    # weights = [x * base for x in [25]]
-
 
     # PATHS
     # load_settings
@@ -64,10 +56,6 @@ def main(task_id: int):
         os.chdir(root_path / "data")
 
     # generate result folder
-
-    results_root = f"./outputs_{time_str}_{dir_extension}_{str(task_id)}"
-    if not os.path.exists(results_root):
-        os.makedirs(results_root)
 
     # generate sample
     # m_api = ModelApi(config="./config.json", dataset=dataset, folder_output=results_root + "/sampling")
@@ -86,13 +74,32 @@ def main(task_id: int):
     # sample.to_csv(f"./outputs_{time_str}_{dir_extension}/sample.csv", index=False)
 
 
-
-    # Main run
+    # Main run with weighting factor
+    dir_extension = "fixed_cross_terms_1periods_with_operation"
+    results_root = f"./outputs_{time_str}_{dir_extension}_weighting_factor"
+    if not os.path.exists(results_root):
+        os.makedirs(results_root)
+    #
     include_variances_for = "technology_capex"
     result_folder = f"{results_root}/lambda_{str(weight)}"
     m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
     m_api.solve_model()
-    m_api.solve_operation_only(result_folder, sample, include_variances_for)
+    objective_value = float(m_api.optimization_setup.model.variables["net_present_cost"].solution.sum("set_time_steps_yearly"))
+    # m_api.reevaluate_objective(result_folder, sample, include_variances_for)
+
+    # Main run with cost limit
+    dir_extension = "fixed_cross_terms_1periods_with_operation"
+    results_root = f"./outputs_{time_str}_{dir_extension}_cost_limit"
+    if not os.path.exists(results_root):
+        os.makedirs(results_root)
+    result_folder = f"{results_root}/lambda_{str(weight)}"
+
+
+    config["method"] = "cost_constraint"
+    config["cost_constraint"] = objective_value
+    m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
+    m_api.solve_model()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

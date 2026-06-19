@@ -6,7 +6,9 @@ from zen_garden.plugins.mean_variance_optimization.helpers import generate_sum_l
     get_non_zero_elements
 
 config = {
+    "method": "weighting_factor", # cost_constraint, weighting_factor
     "weighting_factor": None,
+    "cost_constraint": None,
     "include_variances_for": ["technology_capex", "technology_opex", "import", "export", "demand_shedding"],
 }
 
@@ -102,12 +104,6 @@ def calculate_variance_from_solution(postprocessing=None):
         v: k
         for k, v in covariance_matrix_indexmap.items()
     }
-    # Solved capacity additions → aggregate over locations and time steps
-    capacity_addition_sol = (
-        postprocessing.optimization_setup.model.variables["capacity_addition"]
-        .solution
-        .sum(["set_location", "set_time_steps_yearly"])
-    )
 
     variance = 0.0
     covariance_rows = []
@@ -137,7 +133,12 @@ def calculate_variance_from_solution(postprocessing=None):
         C_i = float(postprocessing.optimization_setup.model.variables["capacity_addition"].solution.sel(selection_dict_i).sum(sum_list_i))
         C_j = float(postprocessing.optimization_setup.model.variables["capacity_addition"].solution.sel(selection_dict_j).sum(sum_list_j))
 
-        variance += covariance * C_i * C_j
+
+        if index_i != index_j:
+            factor = 2
+        else:
+            factor = 1
+        variance += factor * covariance * C_i * C_j
 
         covariance_rows.append({
             "pair": pair,
@@ -166,27 +167,35 @@ def calculate_variance_from_solution(postprocessing=None):
 
 @EventPublisher.register(Event.after_model_construction)
 def construct_mean_variance_objective(optimization_setup=None):
-
-
-    quadratic_term = 0
+    variance_term = 0
 
     weighting_factor = config.get("weighting_factor")
     if weighting_factor:
         if "technology_capex" in config.get("include_variances_for"):
-            quadratic_term = _only_technology_correlation(optimization_setup, quadratic_term)
+            variance_term = _only_technology_correlation(optimization_setup, variance_term)
 
 
     optimization_setup.model.remove_objective()
 
     npv_term = optimization_setup.model.variables["net_present_cost"].sum("set_time_steps_yearly")
 
-    weighting_factor = config.get("weighting_factor")
-    if weighting_factor is None: weighting_factor = 0
+    method = config.get("method")
 
-    objective = weighting_factor * quadratic_term + npv_term
-    sense = "min"
-    optimization_setup.model.add_objective(objective, sense=sense)
+    if method == "weighting_factor":
+        weighting_factor = config.get("weighting_factor")
+        if weighting_factor is None: weighting_factor = 0
+        objective = weighting_factor * variance_term + npv_term
+        sense = "min"
+        optimization_setup.model.add_objective(objective, sense=sense)
 
+    elif method == "cost_constraint":
+        # objective is variance
+        objective = variance_term
+        sense = "min"
+        optimization_setup.model.add_objective(objective, sense=sense)
 
-
-
+        # Limit cost
+        constraint_cost_objective = npv_term <= config.get("cost_constraint")
+        optimization_setup.constraints.add_constraint(
+            f"constraint_cost_variance_plugin", constraint_cost_objective
+        )
