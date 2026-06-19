@@ -10,7 +10,7 @@ from zen_garden.plugins.mean_variance_optimization.plugin import config, constru
 from preprocessing.helpers import ModelApi, construct_model, generate_samples
 
 def get_parameter_grid():
-    base = 10e-6
+    base = 10e-10
     weights = [x * base for x in [0, 25, 50, 75, 100]]
     # weights = [x * base for x in [0, 25]]
     return {
@@ -75,7 +75,7 @@ def main(task_id: int):
 
 
     # Main run with weighting factor
-    dir_extension = "fixed_cross_terms_1periods_with_operation"
+    dir_extension = "CrystalBall_10periods_snapshot"
     results_root = f"./outputs_{time_str}_{dir_extension}_weighting_factor"
     if not os.path.exists(results_root):
         os.makedirs(results_root)
@@ -88,7 +88,6 @@ def main(task_id: int):
     # m_api.reevaluate_objective(result_folder, sample, include_variances_for)
 
     # Main run with cost limit
-    dir_extension = "fixed_cross_terms_1periods_with_operation"
     results_root = f"./outputs_{time_str}_{dir_extension}_cost_limit"
     if not os.path.exists(results_root):
         os.makedirs(results_root)
