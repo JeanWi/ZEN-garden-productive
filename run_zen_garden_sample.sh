@@ -3,7 +3,7 @@
 #SBATCH --time=00:20:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=10G
+#SBATCH --mem-per-cpu=4G
 #SBATCH --output=zen_garden_%A_%a.out
 #SBATCH --error=zen_garden_%A_%a.err
 
