@@ -12,7 +12,7 @@ from preprocessing.helpers import ModelApi, construct_model, generate_samples
 
 # SETTINGS
 run_on = "local"  # epse_server, euler, local
-example_dataset = True
+example_dataset = False
 
 nr_timesteps = 1
 

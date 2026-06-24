@@ -18,3 +18,5 @@ source .venv/bin/activate
 python -m main_run_sample \
     --nr_time_steps 1
     --run_on "euler"
+
+#python -m main_run_sample --nr_time_steps 1 --run_on "local"
