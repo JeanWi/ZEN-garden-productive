@@ -17,8 +17,8 @@ python -m venv .venv
 source .venv/bin/activate
 
 python -m main_run_mean_variance_snapshot \
-    --task_id ${SLURM_ARRAY_TASK_ID}
-    --nr_time_steps 1
+    --task_id ${SLURM_ARRAY_TASK_ID} \
+    --nr_time_steps 1 \
     --run_on euler
 
 #python -m main_run_mean_variance_snapshot --task_id 8 --nr_time_steps 1 --run_on "local"
