@@ -160,7 +160,7 @@ def generate_samples(
 
     return pd.DataFrame(samples, columns=cols)
 
-def generate_delta_xr(sample, techs, original_cost_xr, tech_dim, location_dim):
+def generate_delta_xr_technologies(sample, techs, original_cost_xr, tech_dim, location_dim):
     delta = pd.DataFrame(sample.index.tolist(),
                          columns=[tech_dim, location_dim, "set_time_steps_yearly", "set_capacity_types"])
     values = sample.values.tolist()
@@ -185,6 +185,31 @@ def generate_delta_xr(sample, techs, original_cost_xr, tech_dim, location_dim):
 
     return delta_xr
 
+
+def generate_delta_xr_imports(sample, carriers, original_cost_xr):
+    delta = pd.DataFrame(sample.index.tolist(),
+                         columns=["set_carriers", "set_nodes", "set_time_steps_operation"])
+    values = sample.values.tolist()
+    delta["values"] = values
+
+    delta_filtered = delta[delta["set_carriers"].isin(carriers)]
+
+    delta_xr = xr.zeros_like(original_cost_xr)
+    for _, row in delta_filtered.iterrows():
+
+        selector = {}
+
+        for dim in delta_xr.dims:
+            val = row[dim]
+
+            if val == "aggregated":
+                selector[dim] = delta_xr.coords[dim]
+            else:
+                selector[dim] = [val]
+
+        delta_xr.loc[selector] += row["values"]
+
+    return delta_xr
 
 class ModelApi:
 
@@ -314,6 +339,7 @@ class ModelApi:
                 self.capex_specific_storage = self.optimization_setup.parameters.capex_specific_storage.copy()
                 self.capex_specific_transport = self.optimization_setup.parameters.capex_specific_transport.copy()
                 self.capex_specific_conversion = self.optimization_setup.parameters.capex_specific_conversion.copy()
+                self.price_import = self.optimization_setup.parameters.price_import.copy()
 
     def solve_model(self, skip_postprocess = False, skip_scaling = False):
         optimization_setup = self.optimization_setup
@@ -426,7 +452,7 @@ class ModelApi:
         location_dim = "set_nodes"
         techs = capex_specific_storage_original.coords[tech_dim].values
 
-        delta_xr = generate_delta_xr(sample, techs, capex_specific_storage_original, tech_dim, location_dim)
+        delta_xr = generate_delta_xr_technologies(sample, techs, capex_specific_storage_original, tech_dim, location_dim)
 
         capex_specific_storage = capex_specific_storage_original + delta_xr
 
@@ -484,7 +510,7 @@ class ModelApi:
         location_dim = "set_nodes"
         techs = capex_specific_conversion_original.coords[tech_dim].values
 
-        delta_xr = generate_delta_xr(sample, techs, capex_specific_conversion_original, tech_dim, location_dim)
+        delta_xr = generate_delta_xr_technologies(sample, techs, capex_specific_conversion_original, tech_dim, location_dim)
 
         capex_specific_conversion = capex_specific_conversion_original + delta_xr
 
@@ -544,7 +570,7 @@ class ModelApi:
         location_dim = "set_edges"
         techs = capex_specific_transport_original.coords[tech_dim].values
 
-        delta_xr = generate_delta_xr(sample, techs, capex_specific_transport_original, tech_dim, location_dim)
+        delta_xr = generate_delta_xr_technologies(sample, techs, capex_specific_transport_original, tech_dim, location_dim)
 
         capex_specific_transport = capex_specific_transport_original + delta_xr
 
@@ -748,7 +774,7 @@ class ModelApi:
         if validation:
             delta_xr = 0
         else:
-            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_conversion_original, tech_dim, location_dim)
+            delta_xr = generate_delta_xr_technologies(sample_row, techs, capex_specific_conversion_original, tech_dim, location_dim)
 
         capex_specific_conversion = capex_specific_conversion_original + delta_xr
         capex_specific_conversion = capex_specific_conversion.broadcast_like(
@@ -806,7 +832,7 @@ class ModelApi:
         if validation:
             delta_xr = 0
         else:
-            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_storage_original, tech_dim, location_dim)
+            delta_xr = generate_delta_xr_technologies(sample_row, techs, capex_specific_storage_original, tech_dim, location_dim)
 
         capex_specific_storage = capex_specific_storage_original + delta_xr
 
@@ -866,7 +892,7 @@ class ModelApi:
         if validation:
             delta_xr = 0
         else:
-            delta_xr = generate_delta_xr(sample_row, techs, capex_specific_transport_original, tech_dim, location_dim)
+            delta_xr = generate_delta_xr_technologies(sample_row, techs, capex_specific_transport_original, tech_dim, location_dim)
 
         capex_specific_transport = capex_specific_transport_original + delta_xr
 
@@ -925,29 +951,105 @@ class ModelApi:
 
         return cost_capex_overnight
 
+    def get_year_time_step_array(self):
+        """Returns array with year and time steps of each year.
 
+        :param storage: boolean indicating if object is a storage object
+        """
+        # create times xarray with 1 where the operation time step is in the year
+        meth = self.optimization_setup.energy_system.time_steps.get_time_steps_year2operation
+        time_step_name = "set_time_steps_operation"
+        times = [(y, t) for y in self.optimization_setup.sets["set_time_steps_yearly"] for t in meth(y)]
+        times = pd.MultiIndex.from_tuples(times)
+        times.names = ["set_time_steps_yearly", time_step_name]
+        times = pd.Series(index=times, data=1)
+        times = times.to_xarray()
+        times = times.fillna(0.0)
+        return times
 
+    def calculate_cost_carrier_total(self, cost_carrier, cost_shed_demand, validation):
+        times = self.get_year_time_step_array()
+        times = times * self.optimization_setup.parameters.time_steps_operation_duration
+
+        cost_carrier_total = (cost_carrier.broadcast_like(times) + cost_shed_demand.broadcast_like(times)) * times
+        cost_carrier_total = cost_carrier_total.sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_carrier_total"].solution,
+                cost_carrier_total,
+                rtol=1e-5,  # relative tolerance
+                atol=1e-8,  # absolute tolerance
+            )
+        return cost_carrier_total
+
+    def calculate_cost_carrier(self, sample_row, validation):
+
+        cost_exports = self.optimization_setup.parameters.price_export * self.optimization_setup.model.variables["flow_export"].solution
+
+        imports = self.optimization_setup.model.variables["flow_import"].solution
+        price_import_original = self.price_import.copy()
+
+        carriers = price_import_original.coords["set_carriers"].values
+
+        if validation:
+            delta_xr = 0
+        else:
+            delta_xr = generate_delta_xr_imports(sample_row, carriers, price_import_original)
+
+        price_import = price_import_original + delta_xr
+
+        cost_imports = imports * price_import
+        cost_carrier = cost_imports - cost_exports
+
+        if validation:
+            xr.testing.assert_allclose(
+                self.optimization_setup.model.variables["cost_carrier"].solution,
+                cost_carrier,
+                rtol=1e-5,  # relative tolerance
+                atol=1e-8,  # absolute tolerance
+            )
+
+        return cost_carrier
 
     def _compute_single_objective(self, sample_row, include_variances_for, validation=False):
         """Helper method to compute objective for a single sample (for parallelization)."""
-        if include_variances_for == "technology_capex":
-            cost_capex_overnight = self.calculate_cost_capex_overnight(sample_row, validation)
+        if "technology_capex" in include_variances_for:
+            if sample_row is None:
+                tech_sample = None
+            else:
+                tech_sample = sample_row["technology_capex"]
+
+            cost_capex_overnight = self.calculate_cost_capex_overnight(tech_sample, validation)
             cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
             cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
-            cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
-            cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
-            cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
-            cost_total = self.calculate_cost_total(
-                cost_capex_yearly_total, 
-                cost_opex_yearly_total, 
-                cost_carrier_total, 
-                cost_carbon_emissions_total, 
-                validation
-            )
-            net_present_cost = self.calculate_net_present_costs(cost_total)
-            return float(net_present_cost.sum("set_time_steps_yearly"))
         else:
-            raise NotImplementedError(f"Variance type {include_variances_for} not yet supported")
+            cost_capex_yearly_total = self.optimization_setup.model.variables["cost_capex_yearly_total"].solution
+
+        if "imports" in include_variances_for:
+            if sample_row is None:
+                import_sample = None
+            else:
+                import_sample = sample_row["imports"]
+
+            cost_carrier = self.calculate_cost_carrier(import_sample, validation)
+            cost_shed_demand = self.optimization_setup.model.variables["cost_shed_demand"].solution
+            cost_carrier_total = self.calculate_cost_carrier_total(cost_carrier, cost_shed_demand, validation)
+        else:
+            cost_carrier_total = self.optimization_setup.model.variables["cost_carrier_total"].solution
+
+        cost_opex_yearly_total = self.optimization_setup.model.variables["cost_opex_yearly_total"].solution
+        cost_carbon_emissions_total = self.optimization_setup.model.variables["cost_carbon_emissions_total"].solution
+        cost_total = self.calculate_cost_total(
+            cost_capex_yearly_total,
+            cost_opex_yearly_total,
+            cost_carrier_total,
+            cost_carbon_emissions_total,
+            validation
+        )
+        net_present_cost = self.calculate_net_present_costs(cost_total)
+        return float(net_present_cost.sum("set_time_steps_yearly"))
+
 
     def reevaluate_objective(self, result_folder, sample, include_variances_for):
         """Solve operation-only problem for multiple samples.
