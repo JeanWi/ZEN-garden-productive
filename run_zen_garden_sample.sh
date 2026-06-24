@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=zen_garden
+#SBATCH --job-name=zen_garden_sample
 #SBATCH --time=00:20:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=zen_garden_%A_%a.out
-#SBATCH --error=zen_garden_%A_%a.err
+#SBATCH --output=zen_garden_sample%A_%a.out
+#SBATCH --error=zen_garden_sample%A_%a.err
 
 module load stack/2024-06
 module load gcc/12.2.0
