@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=zen_garden
-#SBATCH --time=00:20:00
+#SBATCH --time=04:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=10G
 #SBATCH --output=zen_garden_%A_%a.out
 #SBATCH --error=zen_garden_%A_%a.err
