@@ -9,6 +9,8 @@ import argparse
 from zen_garden.plugins.mean_variance_optimization.plugin import config, construct_mean_variance_objective
 from zen_garden.plugins.mean_variance_optimization.helpers import CovarianceImports, CovarianceTechnologies
 from preprocessing.helpers import ModelApi, construct_model, generate_samples
+from zen_garden.wrapper.utils import modify_json
+
 
 # SETTINGS
 example_dataset = False
@@ -30,6 +32,17 @@ def main(nr_timesteps: int, run_on: str):
     else:
         dataset = "Crystal_Ball"
         os.chdir(root_path / "data")
+
+    modify_json(
+        root_path / "data" / dataset / "system.json",
+        {
+            "aggregated_time_steps_per_year": nr_timesteps,
+            "reference_year": 2050,
+            "optimized_years": 1,
+            "interval_between_years": 1,
+            "conduct_time_series_aggregation": True
+        },
+    )
 
     # generate result folder
     dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_full_covariance_matrix"
