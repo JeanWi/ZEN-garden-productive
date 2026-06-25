@@ -60,8 +60,8 @@ def main(nr_timesteps: int, run_on: str):
         sample[item] = generate_samples(covariance_matrix_upper, covariance_map, n_samples=n_samples)
 
     sample = pd.concat(sample, names=["VarianceType"], axis=1)
-    sample.to_csv(Path(f"./sample_T{str(nr_timesteps)}.csv"), index=False)
-    sample.to_pickle(Path(f"./sample_T{str(nr_timesteps)}.pkl"))
+    sample.to_csv(root_path / f".sample_T{str(nr_timesteps)}.csv", index=False)
+    sample.to_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
 
 
 if __name__ == "__main__":
