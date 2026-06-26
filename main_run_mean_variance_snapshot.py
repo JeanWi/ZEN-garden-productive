@@ -91,7 +91,7 @@ if __name__ == "__main__":
     task_id = args.task_id
 
     run_array = pd.read_excel("Run_array.xlsx", index_col=0)
-    this_run = run_array.loc[1]
+    this_run = run_array.loc[task_id]
 
     main(
         task_id=args.task_id,
