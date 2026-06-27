@@ -1136,6 +1136,7 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
     tol = float(ora_cfg["tolerance"])
     Md_override = ora_cfg.get("Md_override", 1e8)
     t_max_override = ora_cfg.get("t_max_override", None)
+    use_bigM = bool(ora_cfg.get("use_bigM", False))
 
     # fmax: solve the n_z auxiliary U_i* LPs (always solved, no cache; each
     # full solution is saved via Postprocess) BEFORE the projection model is
@@ -1162,7 +1163,7 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
         poly = approximation(
             A=A0, X=z_star.reshape(1, -1), b=b0,
             name_list=name_list,
-            use_bigM=False,
+            use_bigM=use_bigM,
         )
         # Big-M defaults are tuned for normalised toys; loosen for Crystal Ball.
         poly.Md = float(Md_override)
