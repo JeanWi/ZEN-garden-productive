@@ -75,6 +75,17 @@ config = {
     "oracle": {},
 }
 
+# Cut-validity guard trigger: a returned cut must keep every KNOWN
+# near-optimal point (z* and all previous z_feas = pyoNearOpt's X) inside the
+# outer approximation. Inexact projection duals (e.g. barrier without
+# crossover, or a numerically distressed solve) can produce a plane that
+# slices into R_eps: run-08's polytope row 391 cut off 14 inner points by up
+# to 0.044. Violations above this trigger are repaired in find_nearest_point
+# by relaxing b_cut out to the farthest known inner point. The trigger sits
+# above coordinate-rounding noise (up to ~3e-4 from ORACLE's 1e-4 zeroing of
+# z_feas after the cut is built) and far below real failures.
+CUT_GUARD_TRIGGER = 1e-4
+
 # Default Gurobi options for ORACLE's internal polytope MILPs; override via
 # the oracle.milp_options config key (values must be numbers or strings).
 DEFAULT_MILP_OPTIONS = {
@@ -253,6 +264,12 @@ class MGA:
         self.u_star = None
         self._u_tilde = None
         self._offset = None
+
+        # Cut-validity guard state (oracle mode): every point handed to the
+        # inner approximation, in explore coordinates. Seeded with z* by
+        # setup_projection_model, extended and checked against each new cut
+        # in find_nearest_point.
+        self._inner_points = None
 
         # --- Build the canonical list of exploration axes (see class Axis) ---
         # Tech axes come first (in the order implied by include_techs /
@@ -947,6 +964,9 @@ class MGA:
                 name="mga_oracle_t_neg_cost",
             )
 
+        # Seed the cut-validity guard with z* (row 0 of pyoNearOpt's X).
+        self._inner_points = [np.asarray(self.z_star_explore, dtype=float)]
+
         logging.info(
             f"MGA oracle: projection model added (n_z = {self.n_z} axes on "
             f"dim {Z_DIM!r}, include_cost = {self.include_cost})"
@@ -958,7 +978,9 @@ class MGA:
         trial_point arrives in ORACLE polytope coordinates (always normalised;
         augmented with a cost coordinate as the last entry when include_cost).
         Returns (z_feas, dist, mu_cut, b_cut, flag) in the SAME coordinates;
-        mu_cut is L2-normalised and b_cut = mu_cut @ z_feas.
+        mu_cut is L2-normalised and b_cut = mu_cut @ z_feas, possibly relaxed
+        by the cut-validity guard so no known inner point is cut off (see
+        CUT_GUARD_TRIGGER).
 
         Coordinate algebra:
             trial_raw = offset + trial_norm * U_tilde         (proj-eq RHS)
@@ -1039,6 +1061,37 @@ class MGA:
         if scale > 1e-4:
             mu_cut = mu_cut / scale
         b_cut = float(mu_cut @ z_feas)
+
+        # --- Cut-validity guard: never cut off a known near-optimal point ---
+        # Every previous z_feas (and z*) lies in R_eps, so a valid supporting
+        # hyperplane must keep them all inside. If the plane violates that
+        # (bad projection duals), keep its direction but push it out to the
+        # farthest known inner point. See CUT_GUARD_TRIGGER.
+        if self._inner_points is not None:
+            pts = np.vstack(self._inner_points)
+            worst = float((pts @ mu_cut - b_cut).max())
+            if worst > CUT_GUARD_TRIGGER:
+                logging.warning(
+                    f"MGA oracle iter {self._iter_count}: cut would remove "
+                    f"known near-optimal point(s) by up to {worst:.4g} "
+                    f"(inexact projection duals?); relaxing b_cut "
+                    f"{b_cut:.6g} -> {b_cut + worst:.6g}"
+                )
+                b_cut = float(b_cut + worst + 1e-9)
+                if float(mu_cut @ trial_point) <= b_cut:
+                    # Correctness first: O must stay an outer approximation.
+                    # But the relaxed plane no longer excludes the trial
+                    # point, so ORACLE may re-find the same trial next
+                    # iteration and stop on its identical-feasible-point
+                    # check — a loud failure instead of a corrupted O.
+                    logging.error(
+                        "MGA oracle: relaxed cut no longer excludes the "
+                        "trial point — the projection duals are unreliable "
+                        "this iteration (consider re-solving with "
+                        "crossover). ORACLE may stall on a repeating trial "
+                        "point."
+                    )
+            self._inner_points.append(np.asarray(z_feas, dtype=float))
 
         logging.info(
             f"MGA oracle iter {self._iter_count}: dist = {dist:.4g} "
