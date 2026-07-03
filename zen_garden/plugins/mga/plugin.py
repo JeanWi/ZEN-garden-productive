@@ -35,10 +35,26 @@ Configuration (via the "plugins.mga" block in config.json):
     iterations (list[dict]): weights mode only; one {"weights": {tech: w}}
         dict per iteration.
     oracle (dict): oracle mode only. max_iterations (int), tolerance (float,
-        REQUIRED — no default), Md_override (float), t_max_override
-        (float|None), include_cost (bool, default False), milp_options (dict
-        of Gurobi options for ORACLE's internal polytope MILPs; defaults to
-        DEFAULT_MILP_OPTIONS). Solver is hardcoded to Gurobi.
+        REQUIRED — no default), formulation (str, "kkt_milp" | "dual_bilinear",
+        default "kkt_milp"): single-level reformulation of the step-2 max-min
+        problem. "kkt_milp" is the published ORACLE MILP (complementarity via
+        SOS1 or Big-M; its DUAL BOUND — the reported metric — stalls at the
+        t_max cap once the inner point count grows, see bsc-thesis/code/diagnostics/ORACLE_metric_diagnosis_and_fix.md).
+        "dual_bilinear" is the LP-duality reformulation (no binaries; solved
+        globally by Gurobi spatial branching; NonConvex=2 is added to the
+        solver options automatically) — same witness and metric semantics,
+        but the bound actually closes. Md_override (float) and use_bigM
+        (bool) apply to kkt_milp only; t_max_override (float|None) applies to
+        both; include_cost (bool, default False); milp_options (dict of
+        Gurobi options for ORACLE's internal step-2 solves — also used for
+        the bilinear solve, which Gurobi treats as a MIP-like global solve,
+        so MIPGap/MIPGapAbs/TimeLimit keep their meaning; defaults to
+        DEFAULT_MILP_OPTIONS). final_certificate_time_limit (float seconds,
+        default 0 = off): after a NON-converged loop, run one long step-2
+        solve on the final geometry (capped by the loop's last reported
+        metric) and store the improved certified metric in the npz — buys
+        the proof once at the end instead of every iteration. Solver is
+        hardcoded to Gurobi.
 """
 
 import logging
@@ -1190,6 +1206,17 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
     Md_override = ora_cfg.get("Md_override", 1e8)
     t_max_override = ora_cfg.get("t_max_override", None)
     use_bigM = bool(ora_cfg.get("use_bigM", False))
+    formulation = str(ora_cfg.get("formulation", "kkt_milp")).lower()
+    if formulation not in ("kkt_milp", "dual_bilinear"):
+        raise ValueError(
+            f"MGA oracle: unknown formulation {formulation!r}; expected "
+            f"'kkt_milp' or 'dual_bilinear'."
+        )
+    if formulation == "dual_bilinear" and use_bigM:
+        logging.warning(
+            "MGA oracle: use_bigM=true is ignored with "
+            "formulation='dual_bilinear' (no complementarity constraints)."
+        )
 
     # fmax: solve the n_z auxiliary U_i* LPs (always solved, no cache; each
     # full solution is saved via Postprocess) BEFORE the projection model is
@@ -1217,7 +1244,9 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
             A=A0, X=z_star.reshape(1, -1), b=b0,
             name_list=name_list,
             use_bigM=use_bigM,
+            formulation=formulation,
         )
+        logging.info(f"MGA oracle: step-2 formulation = {formulation!r}")
         # Big-M defaults are tuned for normalised toys; loosen for Crystal Ball.
         poly.Md = float(Md_override)
         if t_max_override is not None:
@@ -1229,7 +1258,11 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
     #                      protects single-use academic licenses from hanging.
     # Access-time .get: the plugin loader's shallow merge replaces the whole
     # "oracle" dict, so defaults cannot live in the module-level config.
-    milp_options = ora_cfg.get("milp_options", DEFAULT_MILP_OPTIONS)
+    milp_options = dict(ora_cfg.get("milp_options", DEFAULT_MILP_OPTIONS))
+    if formulation == "dual_bilinear":
+        # The dual reformulation's bilinear terms need Gurobi's global
+        # nonconvex-QP mode; explicit so behaviour is version-independent.
+        milp_options.setdefault("NonConvex", 2)
     pyomo_solver = pyo.SolverFactory(
         "gurobi", solver_io="python", manage_env=True
     )
@@ -1264,10 +1297,70 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
                 category=UserWarning,
             )
             df = algo.refine_approximations()
+        df = _maybe_deep_certificate(df, poly, tol, ora_cfg, milp_options)
     finally:
         # Persist artifacts even if refine_approximations raised mid-way.
         _save_polytope_artifacts(mga, poly, df, tol, out)
     return out
+
+
+def _maybe_deep_certificate(df, poly, tol, ora_cfg, milp_options):
+    """One long, capped step-2 solve after a non-converged loop.
+
+    Controlled by oracle.final_certificate_time_limit (seconds; 0/absent =
+    off). Rationale: per-iteration solves get a short TimeLimit because the
+    refinement loop only needs the witness, while the PROOF (the metric)
+    is best bought once, on the final geometry. This runs that one deep
+    solve on the server right after the loop, using the loop's last
+    reported metric as a proven-valid cap (the ratchet guarantees it is an
+    upper bound of the final geometry's distance), and appends the improved
+    certified value as an extra row so the saved npz carries the best-known
+    final_max_min_distance / converged flag. Identical mathematics to a
+    post-hoc run of the diagnostics certifier on the saved polytope: the
+    metric depends only on (A, b, X).
+    """
+    import pandas as pd
+    import pyomo.environ as pyo
+
+    final_tl = float(ora_cfg.get("final_certificate_time_limit", 0) or 0)
+    if df is None or len(df) == 0 or final_tl <= 0:
+        return df
+    last = float(df["max_min_distance"].iloc[-1])
+    if last <= tol:
+        return df
+
+    logging.info(
+        f"MGA oracle: loop ended at {last:.4g} > tol {tol:.4g}; running the "
+        f"final deep certificate (TimeLimit = {final_tl:.0f}s, cap = {last:.4g})."
+    )
+    try:
+        poly.t_max = last  # the run's own reported metric: a proven cap
+        poly.inner_outer_model()
+        solver = pyo.SolverFactory("gurobi", solver_io="python", manage_env=True)
+        opts = dict(milp_options)
+        opts["TimeLimit"] = final_tl
+        solver.set_options(" ".join(f"{k}={v}" for k, v in opts.items()))
+        # load_solutions=False: only the dual bound is needed, and a
+        # solution-less timeout must not raise.
+        solver.solve(poly.out_inner, load_solutions=False, tee=True)
+        deep = min(last, -float(solver._solver_model.ObjBound))
+    except Exception:
+        logging.exception(
+            "MGA oracle: final deep certificate failed; keeping the loop's metric."
+        )
+        return df
+
+    logging.info(
+        f"MGA oracle: final deep certificate {last:.4g} -> {deep:.4g} "
+        f"({'<= tol: CONVERGED (certified)' if deep <= tol else '> tol: not converged'})."
+    )
+    row = {c: None for c in df.columns}
+    row["max_min_distance"] = deep
+    if "iteration" in df.columns:
+        row["iteration"] = int(df["iteration"].iloc[-1]) + 1
+    if "max_min_solve_time" in df.columns:
+        row["max_min_solve_time"] = final_tl
+    return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
 
 
 def _save_polytope_artifacts(mga, poly, df, tol, out):
