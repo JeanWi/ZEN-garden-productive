@@ -1041,7 +1041,31 @@ class MGA:
             f"MGA oracle: starting iteration {self._iter_count}, "
             f"||trial_point||_2 = {np.linalg.norm(trial_point):.4g}"
         )
-        self._solve_and_postprocess(label)
+        try:
+            self._solve_and_postprocess(label)
+        except RuntimeError:
+            # One numerically distressed projection (e.g. barrier iteration
+            # limit — run-14 died this way at iter 189) must not kill the
+            # run. Retry once (threaded barrier runs are not deterministic);
+            # if it fails again, return a zero-distance copy of the previous
+            # inner point: ORACLE's identical-point check then ends the loop
+            # GRACEFULLY, so the polytope artifacts and the final deep
+            # certificate are still produced.
+            logging.exception(
+                f"MGA oracle iter {self._iter_count}: projection solve "
+                f"failed; retrying once."
+            )
+            try:
+                self._solve_and_postprocess(label)
+            except RuntimeError:
+                logging.error(
+                    "MGA oracle: projection failed twice; returning a "
+                    "sentinel point so ORACLE stops gracefully (artifacts + "
+                    "final certificate still run)."
+                )
+                z_prev = np.asarray(self._inner_points[-1], dtype=float).copy()
+                self._iter_count += 1
+                return z_prev, 0.0, None, None, 0
 
         # z_feas in polytope coordinates (already normalised/augmented).
         z_feas = self._extract_z()
@@ -1263,6 +1287,12 @@ def _run_oracle_mode(mga, ora_cfg, optimization_setup, postprocess_ctx):
         # The dual reformulation's bilinear terms need Gurobi's global
         # nonconvex-QP mode; explicit so behaviour is version-independent.
         milp_options.setdefault("NonConvex", 2)
+    # Gurobi's console output reaches the run log twice: once as console text
+    # (LogToConsole, forced on by pyomo's tee) and once mirrored through the
+    # python 'gurobipy' logger, which zen-garden's bare-format stdout logging
+    # prints identically. Silence the logger mirror; keep the console copy.
+    logging.getLogger("gurobipy").propagate = False
+
     pyomo_solver = pyo.SolverFactory(
         "gurobi", solver_io="python", manage_env=True
     )
