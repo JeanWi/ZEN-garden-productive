@@ -303,15 +303,17 @@ def construct_mean_variance_objective(optimization_setup=None):
 
     if method == "weighting_factor":
         weighting_factor = config.get("weighting_factor")
-        if weighting_factor:
+        if weighting_factor is None: weighting_factor = 0
+
+        if weighting_factor != 0:
             if "technology_capex" in config.get("include_variances_for"):
                 variance_term = _technology_correlation(optimization_setup, variance_term)
             if "imports" in config.get("include_variances_for"):
                 variance_term = _import_correlation(optimization_setup, variance_term)
+            objective = weighting_factor * variance_term + npv_term
+        else:
+            objective = npv_term
 
-
-        if weighting_factor is None: weighting_factor = 0
-        objective = weighting_factor * variance_term + npv_term
         sense = "min"
         optimization_setup.model.add_objective(objective, sense=sense)
 
