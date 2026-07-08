@@ -69,7 +69,7 @@ def main(task_id: int,
     # generate result folder
     results_root = f"./outputs_{time_str}_snapshot_{method}_T{str(nr_time_steps)}{result_string}"
     if not os.path.exists(results_root):
-        os.makedirs(results_root)
+        os.makedirs(results_root, exist_ok=True)
 
     sample = pd.read_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
 
