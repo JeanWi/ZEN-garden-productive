@@ -6,7 +6,7 @@
 #SBATCH --mem-per-cpu=8G
 #SBATCH --output=zen_garden_%A_%a.out
 #SBATCH --error=zen_garden_%A_%a.err
-#SBATCH --array=10-11
+#SBATCH --array=12-15
 
 module load stack/2024-06
 module load gcc/12.2.0
