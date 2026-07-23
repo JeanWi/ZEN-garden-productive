@@ -12,7 +12,7 @@ from preprocessing.helpers import ModelApi, construct_model, generate_samples
 
 # SETTINGS
 run_on = "local"  # epse_server, euler, local
-example_dataset = False
+example_dataset = True
 
 nr_timesteps = 1
 
@@ -49,22 +49,34 @@ def main(task_id: int,
 
     root_path = Path(settings[run_on]['root_path'])
     if example_dataset:
+        root_path = Path(f"C:\ZenGardenInput\example_datasets")
         dataset = "8_yearly_variation"
         os.chdir(Path(f"C:\ZenGardenInput\example_datasets"))
+
+        modify_json(
+            root_path / dataset / "system.json",
+            {
+                "aggregated_time_steps_per_year": nr_time_steps,
+                "reference_year": 2023,
+                "optimized_years": 1,
+                "interval_between_years": 1,
+                "conduct_time_series_aggregation": True
+            },
+        )
     else:
         dataset = "Crystal_Ball"
-        os.chdir(root_path / "data")
+        os.chdir(root_path)
 
-    modify_json(
-        root_path / "data" / dataset / "system.json",
-        {
-            "aggregated_time_steps_per_year": nr_time_steps,
-            "reference_year": 2050,
-            "optimized_years": 1,
-            "interval_between_years": 1,
-            "conduct_time_series_aggregation": True
-        },
-    )
+        modify_json(
+            root_path / dataset / "system.json",
+            {
+                "aggregated_time_steps_per_year": nr_time_steps,
+                "reference_year": 2050,
+                "optimized_years": 1,
+                "interval_between_years": 1,
+                "conduct_time_series_aggregation": True
+            },
+        )
 
     # generate result folder
     results_root = f"./outputs_{time_str}_snapshot_{method}_T{str(nr_time_steps)}{result_string}"
@@ -73,13 +85,15 @@ def main(task_id: int,
 
     sample = pd.read_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
 
+    # sample = sample[0:10]
+
     result_folder = f"{results_root}/lambda_{str(weight)}"
     config["method"] = method
     if with_diagonal_variance_only:
         config["include_correlation"] = False
     m_api = construct_model(weight, task_id, dataset, result_folder, include_variances_for)
     m_api.solve_model()
-    m_api.reevaluate_objective(result_folder, sample, include_variances_for)
+    m_api.reevaluate_objective(result_folder, sample, include_variances_for, parallelize=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -90,7 +104,10 @@ if __name__ == "__main__":
 
     task_id = args.task_id
 
-    run_array = pd.read_excel("Run_array.xlsx", index_col=0)
+    if example_dataset:
+        run_array = pd.read_excel("Run_array_test_case.xlsx", index_col=0)
+    else:
+        run_array = pd.read_excel("Run_array.xlsx", index_col=0)
     this_run = run_array.loc[task_id]
 
     main(

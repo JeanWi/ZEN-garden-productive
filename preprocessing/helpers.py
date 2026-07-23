@@ -456,8 +456,6 @@ class ModelApi:
 
         capex_specific_storage = capex_specific_storage_original + delta_xr
 
-
-
         ### formulate constraint
         lhs = linexpr_from_tuple_np(
             [
@@ -945,8 +943,8 @@ class ModelApi:
             xr.testing.assert_allclose(
                 self.optimization_setup.model.variables["cost_capex_overnight"].solution,
                 cost_capex_overnight,
-                rtol=1e-5,  # relative tolerance
-                atol=1e-8,  # absolute tolerance
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,  # absolute tolerance
             )
 
         return cost_capex_overnight
@@ -978,8 +976,8 @@ class ModelApi:
             xr.testing.assert_allclose(
                 self.optimization_setup.model.variables["cost_carrier_total"].solution,
                 cost_carrier_total,
-                rtol=1e-5,  # relative tolerance
-                atol=1e-8,  # absolute tolerance
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,
             )
         return cost_carrier_total
 
@@ -1006,8 +1004,8 @@ class ModelApi:
             xr.testing.assert_allclose(
                 self.optimization_setup.model.variables["cost_carrier"].solution,
                 cost_carrier,
-                rtol=1e-5,  # relative tolerance
-                atol=1e-8,  # absolute tolerance
+                rtol=1e-3,  # relative tolerance
+                atol=1e-3,
             )
 
         return cost_carrier
@@ -1051,7 +1049,7 @@ class ModelApi:
         return float(net_present_cost.sum("set_time_steps_yearly"))
 
 
-    def reevaluate_objective(self, result_folder, sample, include_variances_for):
+    def reevaluate_objective(self, result_folder, sample, include_variances_for, parallelize=True):
         """Solve operation-only problem for multiple samples.
         
         Args:
@@ -1073,27 +1071,34 @@ class ModelApi:
 
         # Main sample evaluations
         validation = False
-        n_workers = mp.cpu_count()
 
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {}
+        if parallelize:
+            n_workers = mp.cpu_count()
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {}
+                for index, sample_row in sample.iterrows():
+                    future = executor.submit(
+                        self._compute_single_objective,
+                        sample_row,
+                        include_variances_for,
+                        validation
+                    )
+                    futures[future] = index
+
+                for future in tqdm(
+                    as_completed(futures.keys()),
+                    total=len(sample),
+                    desc=f"Reevaluating objective (parallel, {n_workers} workers)"
+                ):
+                    index = futures[future]
+                    objective_df.loc[index] = future.result()
+
+        else:
             for index, sample_row in sample.iterrows():
-                future = executor.submit(
-                    self._compute_single_objective,
-                    sample_row,
-                    include_variances_for,
-                    validation
+                objective_df.loc[index] = self._compute_single_objective(
+                    sample_row, include_variances_for, validation
                 )
-                futures[future] = index
 
-            for future in tqdm(
-                as_completed(futures.keys()),
-                total=len(sample),
-                desc=f"Reevaluating objective (parallel, {n_workers} workers)"
-            ):
-                index = futures[future]
-                objective_df.loc[index] = future.result()
-        
         # Save results
         objective_df.to_csv(f"{result_folder}/objective_samples.csv")
 

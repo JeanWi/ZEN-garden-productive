@@ -13,7 +13,7 @@ from zen_garden.wrapper.utils import modify_json
 
 
 # SETTINGS
-example_dataset = False
+example_dataset = True
 
 def main(nr_timesteps: int, run_on: str):
 
@@ -27,22 +27,33 @@ def main(nr_timesteps: int, run_on: str):
 
     root_path = Path(settings[run_on]['root_path'])
     if example_dataset:
+        root_path = Path(f"C:\ZenGardenInput\example_datasets")
         dataset = "8_yearly_variation"
         os.chdir(Path(f"C:\ZenGardenInput\example_datasets"))
+        modify_json(
+            root_path / dataset / "system.json",
+            {
+                "aggregated_time_steps_per_year": nr_timesteps,
+                "reference_year": 2023,
+                "optimized_years": 1,
+                "interval_between_years": 1,
+                "conduct_time_series_aggregation": True
+            },
+        )
     else:
         dataset = "Crystal_Ball"
-        os.chdir(root_path / "data")
+        os.chdir(root_path)
 
-    modify_json(
-        root_path / "data" / dataset / "system.json",
-        {
-            "aggregated_time_steps_per_year": nr_timesteps,
-            "reference_year": 2050,
-            "optimized_years": 1,
-            "interval_between_years": 1,
-            "conduct_time_series_aggregation": True
-        },
-    )
+        modify_json(
+            root_path / dataset / "system.json",
+            {
+                "aggregated_time_steps_per_year": nr_timesteps,
+                "reference_year": 2050,
+                "optimized_years": 1,
+                "interval_between_years": 1,
+                "conduct_time_series_aggregation": True
+            },
+        )
 
     # generate result folder
     dir_extension = f"CrystalBall_{nr_timesteps}periods_snapshot_full_covariance_matrix"
@@ -73,7 +84,7 @@ def main(nr_timesteps: int, run_on: str):
         sample[item] = generate_samples(covariance_matrix_upper, covariance_map, n_samples=n_samples)
 
     sample = pd.concat(sample, names=["VarianceType"], axis=1)
-    sample.to_csv(root_path / f".sample_T{str(nr_timesteps)}.csv", index=False)
+    sample.to_csv(root_path / f"sample_T{str(nr_timesteps)}.csv", index=False)
     sample.to_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
 
 
