@@ -1168,6 +1168,7 @@ class ModelApi:
 def construct_model(weight, task_id, dataset, result_folder, include_variances_for):
     with open("./config.json") as f:
         config = json.load(f)
+    config["solver"]["solver_options"]["Threads"] = 0
     config["plugins"]["mean_variance_optimization"] = {}
     config["plugins"]["mean_variance_optimization"]["weighting_factor"] = weight
     config["plugins"]["mean_variance_optimization"]["include_variances_for"] = include_variances_for
