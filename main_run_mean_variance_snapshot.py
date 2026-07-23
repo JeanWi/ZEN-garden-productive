@@ -85,7 +85,7 @@ def main(task_id: int,
 
     sample = pd.read_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
 
-    # sample = sample[0:10]
+    sample = sample[0:100]
 
     result_folder = f"{results_root}/lambda_{str(weight)}"
     config["method"] = method

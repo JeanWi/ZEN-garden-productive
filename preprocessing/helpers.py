@@ -741,6 +741,8 @@ class ModelApi:
 
 
     def calculate_cost_capex_overnight(self, sample_row, validation):
+
+        cost_assumptions = {}
         cost_capex_overnight = xr.full_like(self.optimization_setup.model.variables["cost_capex_overnight"].solution,
                                             fill_value=np.nan)
 
@@ -778,6 +780,8 @@ class ModelApi:
         capex_specific_conversion = capex_specific_conversion.broadcast_like(
             self.optimization_setup.model.variables["capacity_approximation"].lower
         )
+
+        cost_assumptions["conversion_technologies"] = capex_specific_conversion
 
         capex_approximation = capex_specific_conversion * capacity_approximation
 
@@ -841,6 +845,9 @@ class ModelApi:
                 }
             )
 
+        cost_assumptions["storage_technologies"] = capex_specific_storage
+
+
         capacity_storage = self.optimization_setup.model.variables["capacity_addition"].solution.loc[
                         techs, capacity_types, nodes, times
                     ]
@@ -893,6 +900,9 @@ class ModelApi:
             delta_xr = generate_delta_xr_technologies(sample_row, techs, capex_specific_transport_original, tech_dim, location_dim)
 
         capex_specific_transport = capex_specific_transport_original + delta_xr
+
+        cost_assumptions["transport_technologies"] = capex_specific_transport
+
 
         capex_specific_transport = capex_specific_transport.rename(
                 {
@@ -947,7 +957,22 @@ class ModelApi:
                 atol=1e-3,  # absolute tolerance
             )
 
-        return cost_capex_overnight
+        cost_assumptions_dict = {}
+
+        for key, value in cost_assumptions.items():
+
+            # First, convert to series (which flattens the array)
+            series = value.to_series()
+
+            # Create a new dictionary with formatted keys
+            for idx, value in series.items():
+                # idx is a tuple of (set_technologies, set_capacity_types, set_location, set_time_steps_yearly)
+                if pd.notna(value):  # Skip NaN values
+                    key = f"{idx[0]}_{idx[1]}_{idx[2]}"  # Reordered as you specified
+                    cost_assumptions_dict[key] = float(value)
+
+
+        return cost_capex_overnight, cost_assumptions_dict
 
     def get_year_time_step_array(self):
         """Returns array with year and time steps of each year.
@@ -1012,17 +1037,25 @@ class ModelApi:
 
     def _compute_single_objective(self, sample_row, include_variances_for, validation=False):
         """Helper method to compute objective for a single sample (for parallelization)."""
+
+        run_info = {}
+
         if "technology_capex" in include_variances_for:
             if sample_row is None:
                 tech_sample = None
             else:
                 tech_sample = sample_row["technology_capex"]
 
-            cost_capex_overnight = self.calculate_cost_capex_overnight(tech_sample, validation)
+            cost_capex_overnight, cost_assumptions_dict = self.calculate_cost_capex_overnight(tech_sample, validation)
             cost_capex_yearly = self.calculate_cost_capex_yearly(cost_capex_overnight, validation)
             cost_capex_yearly_total = self.calculate_cost_capex_yearly_total(cost_capex_yearly, validation)
+
         else:
+            cost_assumptions_dict = None
+            cost_capex_overnight = self.optimization_setup.model.variables["cost_capex_overnight"].solution
             cost_capex_yearly_total = self.optimization_setup.model.variables["cost_capex_yearly_total"].solution
+
+
 
         if "imports" in include_variances_for:
             if sample_row is None:
@@ -1045,8 +1078,29 @@ class ModelApi:
             cost_carbon_emissions_total,
             validation
         )
-        net_present_cost = self.calculate_net_present_costs(cost_total)
-        return float(net_present_cost.sum("set_time_steps_yearly"))
+
+        # First, convert to series (which flattens the array)
+        series = cost_capex_overnight.to_series()
+        series.dropna(inplace=True)
+
+        # Create a new dictionary with formatted keys
+        for idx, value in series.items():
+            # idx is a tuple of (set_technologies, set_capacity_types, set_location, set_time_steps_yearly)
+            if pd.notna(value):  # Skip NaN values
+                key = f"{idx[0]}_{idx[2]}_{idx[1]}_{idx[3]}"  # Reordered as you specified
+                run_info[f"cost_overnight_{key}"] = float(value)
+
+        if cost_assumptions_dict:
+            for key, value in cost_assumptions_dict.items():
+                run_info[f"cost_assumption_{key}"] = value
+
+
+        run_info["cost_opex_yearly_total"] = float(cost_opex_yearly_total.sum())
+        run_info["cost_capex_yearly_total"] = float(cost_capex_yearly_total.sum())
+        run_info["net_present_cost"] = float(self.calculate_net_present_costs(cost_total).sum())
+        run_info["cost_carrier_total"] = float(cost_carrier_total.sum())
+        run_info["cost_carbon_emissions_total"] = float(cost_carbon_emissions_total.sum())
+        return run_info
 
 
     def reevaluate_objective(self, result_folder, sample, include_variances_for, parallelize=True):
@@ -1060,14 +1114,18 @@ class ModelApi:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import multiprocessing as mp
         
-        objective_df = pd.Series()
-
         # Validation run
         validation = True
         sample_row = None
-        objective_df.loc["validation"] = self._compute_single_objective(
+
+        run_info = self._compute_single_objective(
             sample_row, include_variances_for, validation
         )
+        objective_df = pd.DataFrame(columns=list(run_info.keys()))
+        objective_df = pd.concat([
+            objective_df,
+            pd.DataFrame([run_info], index=["validation"])
+        ])
 
         # Main sample evaluations
         validation = False
@@ -1091,13 +1149,18 @@ class ModelApi:
                     desc=f"Reevaluating objective (parallel, {n_workers} workers)"
                 ):
                     index = futures[future]
-                    objective_df.loc[index] = future.result()
+                    objective_df.loc[index] = pd.Series(future.result())
 
         else:
             for index, sample_row in sample.iterrows():
-                objective_df.loc[index] = self._compute_single_objective(
+                run_info = self._compute_single_objective(
                     sample_row, include_variances_for, validation
                 )
+
+                objective_df = pd.concat([
+                    objective_df,
+                    pd.DataFrame([run_info], index=[index])
+                ])
 
         # Save results
         objective_df.to_csv(f"{result_folder}/objective_samples.csv")
