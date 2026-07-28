@@ -13,7 +13,7 @@ from zen_garden.wrapper.utils import modify_json
 
 
 # SETTINGS
-example_dataset = True
+example_dataset = False
 
 def main(nr_timesteps: int, run_on: str):
 

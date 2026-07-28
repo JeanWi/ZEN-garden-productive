@@ -169,6 +169,9 @@ def _postprocess_technology_variance(postprocessing, variance_cumsum):
     covariance_matrix_indexmap, covariance_matrix  = covariance_calculation.generate_covariance_matrix()
     covariance_pairs = get_non_zero_elements(covariance_matrix, covariance_matrix_indexmap)
     covariance_rows = []
+
+    include_correlation = config.get("include_correlation")
+
     for pair in tqdm(covariance_pairs, total=len(covariance_pairs),
                        desc="Postprocessing variance (technology correlation)"):
 
@@ -197,9 +200,12 @@ def _postprocess_technology_variance(postprocessing, variance_cumsum):
 
         if index_i != index_j:
             factor = 2
+            if include_correlation:
+                variance_cumsum += factor * covariance * C_i * C_j
         else:
             factor = 1
-        variance_cumsum += factor * covariance * C_i * C_j
+            variance_cumsum += factor * covariance * C_i * C_j
+
 
         covariance_rows.append({
             "pair": pair,
@@ -216,6 +222,7 @@ def _postprocess_technology_variance(postprocessing, variance_cumsum):
 def _postprocess_imports_variance(postprocessing, variance_cumsum):
     optimization_setup = postprocessing.optimization_setup
 
+    include_correlation = config.get("include_correlation")
 
     covariance_calculation = CovarianceImports(optimization_setup)
     covariance_matrix_indexmap, covariance_matrix = covariance_calculation.generate_covariance_matrix()
@@ -247,7 +254,8 @@ def _postprocess_imports_variance(postprocessing, variance_cumsum):
 
         if index_i != index_j:
             factor = 2
-            variance_cumsum += factor * covariance * C_i * C_j
+            if include_correlation:
+                variance_cumsum += factor * covariance * C_i * C_j
         else:
             factor = 1
             variance_cumsum += factor * covariance * C_i * C_j
