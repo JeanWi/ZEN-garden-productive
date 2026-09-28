@@ -1,0 +1,22 @@
+#!/bin/bash
+#SBATCH --job-name=zen_garden_sample
+#SBATCH --time=00:20:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem-per-cpu=8G
+#SBATCH --output=zen_garden_sample%A_%a.out
+#SBATCH --error=zen_garden_sample%A_%a.err
+
+module load stack/2024-06
+module load gcc/12.2.0
+module load python/3.12.8
+module load gurobi/13.0.0
+
+python -m venv .venv
+source .venv/bin/activate
+
+python -m main_run_sample \
+    --nr_time_steps 1 \
+    --run_on euler
+
+#python -m main_run_sample --nr_time_steps 1 --run_on "local"
