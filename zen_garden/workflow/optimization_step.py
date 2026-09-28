@@ -17,6 +17,7 @@ import numpy as np
 from zen_garden.elements.technology import Technology
 from zen_garden.model.construction_service import ModelConstructionService
 from zen_garden.model.optimization_model import OptimizationModel
+from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
 from zen_garden.utils import IISConstraintParser, StringUtils
 from zen_garden.workflow.scaling import Scaling
@@ -121,6 +122,10 @@ class OptimizationStep:
         self.overwrite_time_indices(step)
         # create optimization problem
         self.construct_optimization_problem()
+        # Give plugins a hook to modify the constructed model (e.g., the objective)
+        EventPublisher.trigger(
+            Event.after_model_construction, optimization_model=self.optimization_model
+        )
         self.prepare_scaling()
 
         if no_solve:
@@ -488,7 +493,7 @@ class OptimizationStep:
             scenario_name (str): The name of the scenario being optimized.
             param_map (dict): A dictionary mapping parameter names to their values.
         """
-        Postprocess(
+        postprocessing = Postprocess(
             self.model_schema,
             self.unit_converter,
             self.optimization_model,
@@ -499,4 +504,7 @@ class OptimizationStep:
             model_name=model_name,
             subfolder=subfolder,
             param_map=param_map,
-        ).save_results(scenario_name)
+        )
+        postprocessing.save_results(scenario_name)
+        # Give plugins a hook to evaluate the solution and write additional results
+        EventPublisher.trigger(Event.after_postprocessing, postprocessing=postprocessing)

@@ -6,13 +6,13 @@ import pandas as pd
 from scipy import sparse
 import argparse
 
-from mean_variance_optimization.plugin import config, construct_mean_variance_objective
-from mean_variance_optimization.helpers import CovarianceImports, CovarianceTechnologies
+from preprocessing.helpers import plugin_config as config
+from zen_garden_plugins.mean_variance_optimization.helpers import CovarianceImports, CovarianceTechnologies
 from preprocessing.helpers import ModelApi, construct_model, generate_samples, modify_json
 
 
 # SETTINGS
-example_dataset = False
+example_dataset = True
 
 def main(nr_timesteps: int, run_on: str):
 

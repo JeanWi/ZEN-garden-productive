@@ -6,13 +6,11 @@ import pandas as pd
 from scipy import sparse
 import argparse
 
-from mean_variance_optimization.plugin import config, construct_mean_variance_objective
+from preprocessing.helpers import plugin_config as config
 from preprocessing.helpers import ModelApi, construct_model, generate_samples, modify_json
 
 # SETTINGS
 example_dataset = False
-
-nr_timesteps = 1
 
 def main(task_id: int,
             weight: float,
@@ -81,7 +79,7 @@ def main(task_id: int,
     if not os.path.exists(results_root):
         os.makedirs(results_root, exist_ok=True)
 
-    sample = pd.read_pickle(root_path / f"sample_T{str(nr_timesteps)}.pkl")
+    sample = pd.read_pickle(root_path / f"sample_T{str(nr_time_steps)}.pkl")
 
     # sample = sample[0:100]
 

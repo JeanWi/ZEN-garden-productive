@@ -19,14 +19,16 @@ from zen_garden.model.registries.set_registry import SetRegistry
 from zen_garden.model.schema import ModelSchema
 from zen_garden.plugin_system.events import EventPublisher, Event
 from zen_garden.plugin_system.loader import register_plugins
-from zen_garden.postprocess.postprocess import Postprocess
 from zen_garden.utils import StringUtils, linexpr_from_tuple_np
 from zen_garden.utils.utils import setup_logger
 from zen_garden.workflow.optimization_step import OptimizationStep
 from zen_garden.workflow.optimization_workflow import OptimizationWorkflow
 from zen_garden.workflow.runner import prepare_scenarios
 
-from mean_variance_optimization.plugin import config as mean_variance_config, calculate_variance_from_solution
+
+# Settings of the mean-variance optimization plugin (zen_garden_plugins) that
+# construct_model writes to the config file, e.g., plugin_config["method"] = ...
+plugin_config = {}
 
 
 def modify_json(file_path: Path, change_dict: dict):
@@ -299,8 +301,13 @@ class ModelApi:
                 )
                 # overwrite time indices
                 optimization_step.overwrite_time_indices(step)
-                # create optimization problem (triggers Event.after_model_construction)
+                # create optimization problem
                 optimization_step.construct_optimization_problem()
+                # allow plugins to modify the model (as in OptimizationStep.run_step)
+                EventPublisher.trigger(
+                    Event.after_model_construction,
+                    optimization_model=optimization_step.optimization_model,
+                )
 
                 self.optimization_workflow = optimization_workflow
                 self.optimization_step = optimization_step
@@ -349,22 +356,14 @@ class ModelApi:
                 steps_horizon=self.steps_horizon,
                 step=self.step,
             )
-            # write results
-            postprocessing = Postprocess(
-                optimization_step.model_schema,
-                optimization_step.unit_converter,
-                optimization_step.optimization_model,
-                optimization_step.scaling,
-                optimization_step.time_steps,
-                optimized_time_steps=optimization_step.optimized_time_steps,
+            # write results (triggers Event.after_postprocessing)
+            optimization_step.write_results(
                 scenarios=optimization_step.config.scenarios,
-                model_name=self.model_name,
                 subfolder=subfolder,
+                model_name=self.model_name,
+                scenario_name=scenario_name,
                 param_map=param_map,
             )
-            postprocessing.save_results(scenario_name)
-            # report variance of the solution (formerly Event.after_postprocessing)
-            calculate_variance_from_solution(postprocessing=postprocessing)
         logging.info("--- Optimization finished ---")
 
     def fix_variables(self, variable_names):
@@ -1126,11 +1125,14 @@ def construct_model(weight, task_id, dataset, result_folder, include_variances_f
     with open("./config.json") as f:
         config = json.load(f)
     config["solver"]["solver_options"]["Threads"] = 0
-    # the mean-variance optimization is not an installed ZEN-garden plugin (yet),
-    # so its settings are passed directly to its config instead of via config.json
-    config.get("plugins", {}).pop("mean_variance_optimization", None)
-    mean_variance_config["weighting_factor"] = weight
-    mean_variance_config["include_variances_for"] = include_variances_for
+    if isinstance(include_variances_for, str):
+        include_variances_for = [include_variances_for]
+    config.setdefault("plugins", {})
+    config["plugins"]["mean_variance_optimization"] = {
+        **plugin_config,
+        "weighting_factor": weight,
+        "include_variances_for": include_variances_for,
+    }
     with open(f"./config_quadratic_{str(task_id)}.json", "w") as f:
         json.dump(config, f, indent=4)
 
