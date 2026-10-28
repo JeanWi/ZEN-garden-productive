@@ -36,6 +36,22 @@ class Event(Enum):
     #: elements, parameters, variables, constraints).
     after_model_schema_creation = auto()
 
+    #: Fired once per optimization step, right after the linopy model (sets,
+    #: parameters, variables, constraints and objective) has been constructed
+    #: and before scaling is applied. Observers receive the keyword argument
+    #: ``optimization_step`` (:class:`~zen_garden.workflow.optimization_step.
+    #: OptimizationStep`). Observers may modify the model, e.g.,
+    #: replace the objective.
+    after_model_construction = auto()
+
+    #: Fired once per optimization step, right after the results of the step
+    #: have been written to disk. Observers receive the keyword argument
+    #: ``postprocessing`` (:class:`~zen_garden.postprocess.postprocess.
+    #: Postprocess`), which gives access to the solved model
+    #: (``postprocessing.optimization_model``) and the output folder
+    #: (``postprocessing.name_dir``).
+    after_postprocessing = auto()
+
     #: Placeholder events used only by the test suite and the plugin template.
     test_event1 = auto()
     test_event2 = auto()

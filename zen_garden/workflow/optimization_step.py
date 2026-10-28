@@ -18,6 +18,7 @@ import pandas as pd
 from zen_garden.elements.technology import Technology
 from zen_garden.model.construction_service import ModelConstructionService
 from zen_garden.model.optimization_model import OptimizationModel
+from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
 from zen_garden.utils import IISConstraintParser, StringUtils
 from zen_garden.workflow.scaling import Scaling
@@ -180,6 +181,10 @@ class OptimizationStep:
 
         # Injected services: service_container, model_schema; explicit arguments: none.
         self.service_container.build(ModelConstructionService).construct_model()
+
+        # Let plugins modify the constructed model (e.g., the objective) before
+        # the scaling is computed from it.
+        EventPublisher.trigger(Event.after_model_construction, optimization_step=self)
 
         # Injected services: none; explicit arguments: lp_model, algorithm,
         # include_rhs. Register the resulting Scaling instance as scaling.
@@ -504,7 +509,7 @@ class OptimizationStep:
             scenario_name (str): The name of the scenario being optimized.
             param_map (dict): A dictionary mapping parameter names to their values.
         """
-        Postprocess(
+        postprocessing = Postprocess(
             self.model_schema,
             self.unit_converter,
             self.optimization_model,
@@ -515,4 +520,10 @@ class OptimizationStep:
             model_name=model_name,
             subfolder=subfolder,
             param_map=param_map,
-        ).save_results(scenario_name)
+        )
+        postprocessing.save_results(scenario_name)
+
+        # Let plugins write their own results next to the standard results.
+        EventPublisher.trigger(
+            Event.after_postprocessing, postprocessing=postprocessing
+        )
